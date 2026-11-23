@@ -1,0 +1,75 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fihris"
+dynamic = ["version"]
+description = "A retrieval engine for Arabic and English documents: ingestion, structure-aware chunks, hybrid BM25 and dense search across languages, reranking and access control."
+readme = "README.md"
+license = "AGPL-3.0-only"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+keywords = ["rag", "retrieval", "arabic", "search", "bm25", "embeddings", "reranking", "qdrant"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Natural Language :: Arabic",
+    "Natural Language :: English",
+    "Topic :: Text Processing :: Indexing",
+]
+# Before a PyPI upload, publish pdf-ar and textkeel there and replace the URLs with
+# "pdf-ar>=0.9" and "textkeel>=0.1": PyPI rejects direct URL dependencies.
+dependencies = [
+    "pdf-ar @ https://github.com/oreaba/pdf-ar/archive/5f104c8ec42e7837a75522c709304fdaac815143.zip",
+    "textkeel @ https://github.com/oreaba/textkeel/archive/a3fabb45ac5e923d0285288f17b4cc8fad06ca20.zip",
+    "numpy>=1.26",
+    "sqlalchemy>=2.0.36",
+    "qdrant-client>=1.12",
+    "transformers>=4.46",
+    "sentencepiece>=0.2",
+    "huggingface-hub>=0.26",
+    "pillow>=10.4",
+]
+
+[project.optional-dependencies]
+# PostgreSQL instead of SQLite.
+postgres = [
+    "psycopg[binary]>=3.2",
+]
+# The opus-mt question translator runs locally on torch (CUDA when available).
+translate = [
+    "torch>=2.4",
+]
+# OCR fallback for pages the quality gate rejects. Tesseract 5 itself is installed outside pip.
+ocr = [
+    "pytesseract>=0.3.13",
+]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+    "python-docx>=1.1",
+]
+
+[project.urls]
+Homepage = "https://github.com/oreaba/fihris"
+
+[project.scripts]
+fihris = "fihris.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "fihris.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM"]

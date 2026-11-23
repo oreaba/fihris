@@ -1,0 +1,143 @@
+"""Clients for the model servers (OpenAI-compatible, such as vLLM) and the opus-mt translators.
+
+They are only clients: nothing here starts, stops or reconfigures a server.
+
+- embeddings: ``/v1/embeddings``, vectors normalised to unit length;
+- reranking: token IDs from the reranker's own tokenizer, sent to ``/classify``, scored by the
+  first class probability;
+- translation: opus-mt with beam search over one question at a time, on the GPU when there is
+  one.
+"""
+
+from __future__ import annotations
+
+import json
+import threading
+import urllib.request
+from collections.abc import Sequence
+from pathlib import Path
+from typing import Protocol
+
+import numpy as np
+
+from fihris.config import PINNED, Endpoints
+
+
+class Embedder(Protocol):
+    def embed(self, texts: Sequence[str], truncate: int | None = None) -> np.ndarray: ...
+
+
+class Scorer(Protocol):
+    def score(self, pairs: Sequence[tuple[str, str]]) -> list[float]: ...
+
+
+class Translate(Protocol):
+    def translate(self, text: str, source_lang: str) -> str: ...
+
+
+def _post(url: str, body: dict, timeout: float) -> dict:
+    request = urllib.request.Request(url, data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read())
+
+
+def snapshot(repo: str) -> Path:
+    """A model already in the local Hugging Face cache. Never downloads (air-gapped)."""
+    from huggingface_hub import snapshot_download
+
+    return Path(snapshot_download(repo, local_files_only=True))
+
+
+class EmbeddingClient:
+    def __init__(self, endpoints: Endpoints, model: str = PINNED.embedder_served):
+        self.url, self.model, self.timeout = endpoints.embed_url, model, endpoints.timeout_s
+
+    def embed(self, texts: Sequence[str], truncate: int | None = None) -> np.ndarray:
+        body: dict = {"model": self.model, "input": list(texts)}
+        if truncate:
+            body["truncate_prompt_tokens"] = truncate
+        data = sorted(_post(f"{self.url}/v1/embeddings", body, self.timeout)["data"],
+                      key=lambda r: r["index"])
+        vectors = np.array([row["embedding"] for row in data], dtype=np.float32)
+        return vectors / np.linalg.norm(vectors, axis=1, keepdims=True)
+
+
+class RerankClient:
+    def __init__(self, endpoints: Endpoints, tokenizer_path: Path | None = None,
+                 model: str = PINNED.reranker_served):
+        from transformers import AutoTokenizer
+
+        self.url, self.model, self.timeout = endpoints.rerank_url, model, endpoints.timeout_s
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path or snapshot(PINNED.reranker))
+
+    def inputs(self, pairs: Sequence[tuple[str, str]]) -> list[list[int]]:
+        return self.tokenizer([q for q, _ in pairs], [t for _, t in pairs],
+                              max_length=PINNED.reranker_max_tokens, truncation=True)["input_ids"]
+
+    def score(self, pairs: Sequence[tuple[str, str]]) -> list[float]:
+        if not pairs:
+            return []
+        data = _post(f"{self.url}/classify", {"model": self.model, "input": self.inputs(pairs)},
+                     self.timeout)["data"]
+        return [row["probs"][0] for row in sorted(data, key=lambda row: row["index"])]
+
+
+class GpuMemoryError(RuntimeError):
+    pass
+
+
+def check_gpu(min_free_gib: float) -> dict:
+    """Free and total GPU memory. Raises rather than load next to servers that need the room."""
+    import torch
+
+    if not torch.cuda.is_available():
+        raise GpuMemoryError("no CUDA device; set FIHRIS_TRANSLATOR_DEVICE=cpu to run on the CPU "
+                             "(latency is then not the measured configuration)")
+    free, total = torch.cuda.mem_get_info()
+    info = {"free_gib": round(free / 2**30, 2), "total_gib": round(total / 2**30, 2)}
+    if free / 2**30 < min_free_gib:
+        raise GpuMemoryError(f"only {info['free_gib']} GiB of GPU memory free, need "
+                             f"{min_free_gib}; not loading the translators")
+    return info
+
+
+class OpusTranslator:
+    """Both opus-mt models, loaded once. One lock per model: beam search runs one question at a
+    time, so padding cannot change a translation."""
+
+    def __init__(self, endpoints: Endpoints, paths: dict[str, Path] | None = None):
+        import torch
+        from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+
+        self.device = endpoints.translator_device
+        if self.device != "cpu":
+            self.gpu = check_gpu(endpoints.min_free_gpu_gib)
+        self.models = {}
+        for lang, (repo, token) in PINNED.translators.items():
+            path = (paths or {}).get(lang) or snapshot(repo)
+            tokenizer = AutoTokenizer.from_pretrained(path)
+            model = AutoModelForSeq2SeqLM.from_pretrained(path, dtype=torch.float32).eval()
+            if token and token not in tokenizer.supported_language_codes:
+                raise ValueError(f"{token} is not a target language of {repo}")
+            self.models[lang] = (tokenizer, model.to(self.device), token, threading.Lock())
+
+    def translate(self, text: str, source_lang: str) -> str:
+        import torch
+
+        tokenizer, model, token, lock = self.models[source_lang]
+        source = f"{token} {text}" if token else text
+        inputs = tokenizer([source], max_length=PINNED.translation_max_tokens, truncation=True,
+                           return_tensors="pt").to(self.device)
+        with lock, torch.inference_mode():
+            ids = model.generate(**inputs, num_beams=PINNED.translation_beams,
+                                 max_new_tokens=PINNED.translation_max_tokens)
+        return tokenizer.decode(ids[0], skip_special_tokens=True)
+
+
+def health(url: str, timeout: float = 5.0) -> bool:
+    try:
+        with urllib.request.urlopen(f"{url.rstrip('/')}/health", timeout=timeout) as response:
+            return response.status == 200
+    except OSError:
+        return False

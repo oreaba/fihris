@@ -1,0 +1,255 @@
+"""The ``fihris`` command line: set up, ingest files, search, manage builds and access. Output is
+content-free unless ``--text`` is asked for.
+
+    fihris init-db
+    fihris ingest documents/ --visible-to-all
+    fihris search "How many days of annual leave?" --text
+    fihris status
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+from pathlib import Path
+
+from sqlalchemy import func, select
+
+from fihris.config import PINNED, Endpoints
+from fihris.db import Chunk, Document, Job, Page, create_schema, engine_for, sessions
+from fihris.principal import Principal
+
+
+def _engine(args, **clients):
+    from fihris.engine import Engine
+
+    endpoints = Endpoints.from_env()
+    db = engine_for(args.database or endpoints.database_url)
+    create_schema(db)
+    engine = Engine(endpoints, sessions(db), **clients)
+    engine.load()
+    return engine
+
+
+def _print(data: dict) -> None:
+    print(json.dumps(data, ensure_ascii=False, indent=1, default=str))
+
+
+def cmd_init_db(args) -> int:
+    db = engine_for(args.database or Endpoints.from_env().database_url)
+    create_schema(db)
+    _print({"database": db.url.render_as_string(hide_password=True), "created": True})
+    return 0
+
+
+def cmd_import_pages(args) -> int:
+    """Documents and their page text extracted elsewhere, chunked and embedded as one new build:
+    documents from a JSON-lines catalogue (``Document`` columns per row, at least
+    ``relative_path`` or ``doc_id``), pages from a page index."""
+    from fihris.chunking import load_pages
+    from fihris.chunks import chunk_corpus
+
+    engine = _engine(args)
+    with args.catalogue.open(encoding="utf-8") as handle:
+        rows = [json.loads(line) for line in handle if line.strip()]
+    report: dict = {"documents": engine.upsert_documents(rows),
+                    "pages": engine.import_pages(args.pages)}
+    with engine.make_session() as session:
+        titles = {d.doc_id: d.title for d in session.scalars(select(Document)).all()}
+    chunks = chunk_corpus(load_pages(args.pages), titles)
+    report["chunks"] = len(chunks)
+    vectors = engine.embed_chunks([r["text"] for r in chunks])
+    report["build"] = engine.create_build(chunks, vectors, None, "embedded", args.activate,
+                                          args.build_id)
+    with engine.make_session() as session:
+        indexed = {r["doc_id"] for r in chunks}
+        for doc in session.scalars(select(Document)).all():
+            doc.index_state = "indexed" if doc.doc_id in indexed else "not_indexed"
+        session.commit()
+    engine.load()
+    _print(report)
+    return 0
+
+
+def cmd_status(args) -> int:
+    engine = _engine(args)
+    with engine.make_session() as session:
+        def count(model, *where):
+            return session.scalar(select(func.count()).select_from(model).where(*where))
+
+        build = engine.active_build(session)
+        _print({"active_build": build.build_id if build else None,
+                "build_chunks": count(Chunk, Chunk.build_id == build.build_id) if build else 0,
+                "documents": count(Document), "removed": count(Document, Document.removed),
+                "visible_to_all": count(Document, Document.visible_to_all),
+                "pages": count(Page), "jobs_running": count(Job, Job.state == "running"),
+                "config_sha256": PINNED.sha256})
+    return 0
+
+
+def cmd_builds(args) -> int:
+    engine = _engine(args)
+    _print({"builds": [{"build_id": b.build_id, "state": b.state, "chunks": b.chunk_count,
+                        "documents": b.document_count, "units_sha256": b.units_sha256,
+                        "vectors": b.vectors_source, "created_at": b.created_at}
+                       for b in engine.builds()]})
+    return 0
+
+
+def cmd_activate(args) -> int:
+    engine = _engine(args)
+    engine.activate(args.build_id)
+    _print({"active_build": args.build_id})
+    return 0
+
+
+def cmd_search(args) -> int:
+    engine = _engine(args)
+    principal = (Principal.for_groups(args.groups, args.pilot) if args.groups or args.pilot
+                 else Principal.unrestricted())
+    result = engine.retrieve(args.question, principal)
+    _print({"question_language": result.question_language, "timings": result.timings,
+            "sources": [{"n": s.n, "doc_id": s.doc_id, "page": s.page, "chunk": s.chunk,
+                         "score": s.score, "language": s.language,
+                         **({"text": s.text} if args.text else {})} for s in result.sources]})
+    return 0
+
+
+def cmd_access(args) -> int:
+    """Set documents' groups or visibility, by id or by access-level label."""
+    engine = _engine(args)
+    with engine.make_session() as session:
+        query = select(Document)
+        if args.doc:
+            query = query.where(Document.doc_id.in_(args.doc))
+        if args.access_level:
+            query = query.where(Document.access_level.in_(args.access_level))
+        docs = session.scalars(query).all()
+        for doc in docs:
+            if args.visible_to_all is not None:
+                doc.visible_to_all = args.visible_to_all == "yes"
+            if args.groups is not None:
+                doc.groups = sorted(set(args.groups))
+        session.commit()
+        ids = [d.doc_id for d in docs]
+    engine.refresh_access()
+    if engine.build is not None:
+        for doc_id in ids:
+            engine.refresh_access(doc_id)
+    _print({"documents_changed": len(ids)})
+    return 0
+
+
+SUFFIXES = (".pdf", ".docx", ".doc", ".xlsx", ".pptx", ".html", ".htm", ".md", ".markdown",
+            ".csv", ".txt", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif", ".webp")
+
+
+def _files(paths: list[Path]) -> list[Path]:
+    out = []
+    for path in paths:
+        if path.is_dir():
+            out.extend(sorted(p for p in path.rglob("*")
+                              if p.is_file() and p.suffix.lower() in SUFFIXES))
+        else:
+            out.append(path)
+    return out
+
+
+def cmd_ingest(args) -> int:
+    """Add files, or every supported file in folders, one job each, and wait for them."""
+    engine = _engine(args)
+    files = _files(args.paths)
+    if args.title and len(files) != 1:
+        print("--title needs exactly one file", file=sys.stderr)
+        return 2
+    metadata = {"visible_to_all": True} if args.visible_to_all else {}
+    if args.groups:
+        metadata["group_ids"] = args.groups
+    jobs = []
+    for file in files:
+        with engine.make_session() as session:
+            doc_id, path, checksum = engine.store_upload(file.read_bytes(), file.name)
+            engine.new_document(session, doc_id, path, checksum, file.name,
+                                {**metadata, **({"title": args.title} if args.title else {})},
+                                None)
+            session.commit()
+        jobs.append((engine.submit("ingest", doc_id, None, path=str(path)), doc_id, file))
+    results = []
+    for job_id, doc_id, file in jobs:
+        while True:
+            with engine.make_session() as session:
+                job = session.get(Job, job_id)
+                if job.state in ("succeeded", "failed", "cancelled"):
+                    results.append({"file": file.name, "doc_id": doc_id, "state": job.state,
+                                    "pages_sent_to_review": job.pages_sent_to_review,
+                                    "errors": job.errors})
+                    break
+            time.sleep(1)
+    _print({"files": len(files), "results": results})
+    return 0 if all(r["state"] == "succeeded" for r in results) else 1
+
+
+def cmd_reindex(args) -> int:
+    engine = _engine(args)
+    job_id = engine.submit("reindex_corpus", None, None)
+    while True:
+        with engine.make_session() as session:
+            job = session.get(Job, job_id)
+            if job.state in ("succeeded", "failed", "cancelled"):
+                _print({"job_id": job_id, "state": job.state, "target_build": job.target_build,
+                        "errors": job.errors})
+                return 0 if job.state == "succeeded" else 1
+        time.sleep(2)
+
+
+def parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="fihris", description="Fihris: ingestion, storage and "
+                                "retrieval of Arabic and English documents.")
+    p.add_argument("--database", help="SQLAlchemy URL (default FIHRIS_DATABASE_URL)")
+    sub = p.add_subparsers(dest="command", required=True)
+    sub.add_parser("init-db").set_defaults(run=cmd_init_db)
+    s = sub.add_parser("import-pages", help="documents and page text extracted elsewhere, as a "
+                       "new build")
+    s.add_argument("--catalogue", type=Path, required=True,
+                   help="JSON lines, one document per line")
+    s.add_argument("--pages", type=Path, required=True, help="page index, JSON lines")
+    s.add_argument("--build-id")
+    s.add_argument("--activate", action="store_true")
+    s.set_defaults(run=cmd_import_pages)
+    sub.add_parser("status").set_defaults(run=cmd_status)
+    sub.add_parser("builds").set_defaults(run=cmd_builds)
+    s = sub.add_parser("activate")
+    s.add_argument("build_id")
+    s.set_defaults(run=cmd_activate)
+    s = sub.add_parser("search")
+    s.add_argument("question")
+    s.add_argument("--groups", nargs="*", default=[])
+    s.add_argument("--pilot", action="store_true")
+    s.add_argument("--text", action="store_true", help="print the source texts")
+    s.set_defaults(run=cmd_search)
+    s = sub.add_parser("access", help="set groups or visibility")
+    s.add_argument("--doc", nargs="*")
+    s.add_argument("--access-level", nargs="*")
+    s.add_argument("--visible-to-all", choices=["yes", "no"])
+    s.add_argument("--groups", nargs="*")
+    s.set_defaults(run=cmd_access)
+    s = sub.add_parser("ingest", help="add files or folders and wait for their jobs")
+    s.add_argument("paths", type=Path, nargs="+")
+    s.add_argument("--title", help="for a single file")
+    s.add_argument("--visible-to-all", action="store_true")
+    s.add_argument("--groups", nargs="*", help="group ids that may read the documents")
+    s.set_defaults(run=cmd_ingest)
+    sub.add_parser("reindex", help="re-chunk every document into a new build").set_defaults(
+        run=cmd_reindex)
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parser().parse_args(argv)
+    return args.run(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
