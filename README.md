@@ -1,15 +1,34 @@
 # fihris
 
-Fihris (فهرس, "index") is a retrieval engine for Arabic and English documents. It ingests files, keeps their page text, chunks and vectors, and answers a question with numbered, access-filtered sources that fit a context budget. It stops at retrieval: generating the answer is the caller's job.
+Fihris (فهرس, "index") is a retrieval engine for Arabic and English documents. It does both halves of retrieval-augmented generation up to the answer:
 
-- **Ingestion:** every format [textkeel](https://github.com/oreaba/textkeel) reads, with Arabic PDFs rebuilt from their fonts by [pdf-ar](https://github.com/oreaba/pdf-ar). Pages the quality gate rejects fall back to OCR when OCR passes its own check, and otherwise wait in a review queue.
+- **Ingestion:** it extracts files, checks and stores their page text, chunks it, embeds the chunks and indexes them ([Ingestion](#ingestion)).
+- **Retrieval:** it answers a question with numbered, access-filtered sources that fit a context budget ([Retrieval](#retrieval)).
+
+It stops there: generating the answer from the sources is the caller's job.
+
+- **Formats:** PDF, Word (`.docx`, and `.doc` through a local Word), Excel (`.xlsx`) and PowerPoint (`.pptx`), read by [textkeel](https://github.com/oreaba/textkeel), with Arabic PDFs rebuilt from their fonts by [pdf-ar](https://github.com/oreaba/pdf-ar). Other file types fail with `unsupported_format`.
+- **Quality:** PDF pages the quality gate rejects fall back to OCR when OCR passes its own check. Otherwise they go to a review queue, and their rebuilt text stays searchable until an admin decides.
 - **Chunks:** structure-aware, never crossing a page, each under a `Document:` and `Section:` header. Repeated page furniture is kept once.
 - **Search across languages:** the question is translated into the other language (opus-mt), and BM25 and dense search run on both, so an English question finds Arabic-only evidence and the reverse.
 - **Ranking:** reciprocal rank fusion of the four lists, then a cross-encoder reranker on the top 30, each chunk scored against the question in its own language.
 - **Access:** every document carries groups. A principal sees only documents sharing a group, at every step: keyword, dense, reranking and the library. A document outside a principal's groups is reported as missing.
 - **Builds:** each index build is its own vector collection behind a live alias. Single-document changes update the live build; a corpus re-index builds a new collection, reusing unchanged vectors, and switches only when complete.
 
-## The pipeline
+## Ingestion
+
+`fihris ingest` (or `Engine.submit("ingest", ...)`) runs each file as a job of six steps, each recording its progress:
+
+1. **extract:** PDFs through pdf-ar's `fonts` engine, so Arabic PDFs need their exact fonts in the fonts folder (a missing font fails the job with `missing_fonts`); Word, Excel and PowerPoint through textkeel and its Office text check.
+2. **quality_gate:** each PDF page is `ok` or `review`; an Office file is one page.
+3. **ocr:** PDF pages in review are OCRed, and the OCR text replaces them when it passes its own check. Accepted pages with images and fewer than 50 words get the OCR lines they lack appended. Pages still in review go to the extraction review queue.
+4. **chunk:** structure-aware chunks, never crossing a page, each under a `Document:` and `Section:` header.
+5. **embed:** each chunk through the embedding server (Qwen3-Embedding 4B).
+6. **index:** the chunks into the database, where keyword search reads them, and their vectors into Qdrant, in the live build.
+
+Other jobs reuse these steps: `replace` (a new version of a file: all six), `remove`, `reindex_document` and `rechunk_page` (chunk, embed, index) and `reindex_corpus` (chunk, embed and index into a new build, then switch the live alias). `fihris import-pages` (see [Use](#use)) loads page text extracted elsewhere and skips extraction.
+
+## Retrieval
 
 1. Translate the question into the other language (opus-mt, local).
 2. BM25 on the question and on its translation, top 100 each, over the allowed chunks.
