@@ -18,7 +18,7 @@ Fihris (فهرس, "index") is a retrieval engine for Arabic and English document
 5. `bge-reranker-v2-m3` on the top 30.
 6. The chunks that fit whole in 8,000 characters, numbered from 1.
 
-These settings are pinned in [`config.py`](src/fihris/config.py) (`Pinned`) and fingerprinted, and every build records the fingerprint of the configuration that made it.
+These settings are pinned in [`config.py`](https://github.com/oreaba/fihris/blob/main/src/fihris/config.py) (`Pinned`) and fingerprinted, and every build records the fingerprint of the configuration that made it.
 
 ## What it needs
 
@@ -40,10 +40,13 @@ Model files are read from the local Hugging Face cache only (`local_files_only`)
 Python 3.11 or later:
 
 ```
-pip install "fihris[postgres,translate,ocr] @ git+https://github.com/oreaba/fihris.git"
+pip install "fihris[translate]"                  # with SQLite
+pip install "fihris[postgres,translate,ocr]"     # PostgreSQL and the OCR fallback too
 ```
 
-Or from a clone: `pip install -e ".[translate,ocr,dev]"`.
+Or from a clone of the [repository](https://github.com/oreaba/fihris): `pip install -e ".[translate,ocr,dev]"`.
+
+Search translates every question, so it needs the `translate` extra (torch). Without it, ingestion, the library and builds still work. Install the torch build that matches your hardware first if you want CUDA.
 
 ## Use
 
@@ -99,4 +102,4 @@ Model servers are replaced by deterministic fakes, and the vector store by `Memo
 
 ## License
 
-[AGPL-3.0](LICENSE). Fihris requires textkeel, pdf-ar and PyMuPDF, which are AGPL-3.0 (PyMuPDF also sells a commercial license).
+[AGPL-3.0](https://github.com/oreaba/fihris/blob/main/LICENSE). Fihris requires textkeel, pdf-ar and PyMuPDF, which are AGPL-3.0 (PyMuPDF also sells a commercial license).

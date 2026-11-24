@@ -12,16 +12,20 @@ license-files = ["LICENSE"]
 requires-python = ">=3.11"
 keywords = ["rag", "retrieval", "arabic", "search", "bm25", "embeddings", "reranking", "qdrant"]
 classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Natural Language :: Arabic",
     "Natural Language :: English",
     "Topic :: Text Processing :: Indexing",
 ]
-# Before a PyPI upload, publish pdf-ar and textkeel there and replace the URLs with
-# "pdf-ar>=0.9" and "textkeel>=0.1": PyPI rejects direct URL dependencies.
 dependencies = [
-    "pdf-ar @ https://github.com/oreaba/pdf-ar/archive/5f104c8ec42e7837a75522c709304fdaac815143.zip",
-    "textkeel @ https://github.com/oreaba/textkeel/archive/a3fabb45ac5e923d0285288f17b4cc8fad06ca20.zip",
+    "pdf-ar>=0.1",
+    "textkeel>=0.1",
     "numpy>=1.26",
     "sqlalchemy>=2.0.36",
     "qdrant-client>=1.12",
@@ -52,6 +56,8 @@ dev = [
 
 [project.urls]
 Homepage = "https://github.com/oreaba/fihris"
+Repository = "https://github.com/oreaba/fihris"
+Issues = "https://github.com/oreaba/fihris/issues"
 
 [project.scripts]
 fihris = "fihris.cli:main"
