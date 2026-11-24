@@ -24,8 +24,8 @@ classifiers = [
     "Topic :: Text Processing :: Indexing",
 ]
 dependencies = [
-    "pdf-ar>=0.1",
-    "textkeel>=0.1",
+    "pdf-ar>=0.2",
+    "textkeel>=0.3",
     "numpy>=1.26",
     "sqlalchemy>=2.0.36",
     "qdrant-client>=1.12",
