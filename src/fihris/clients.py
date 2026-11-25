@@ -23,10 +23,6 @@ from typing import Protocol
 
 import numpy as np
 
-# The measured translators tokenize without sacremoses: installing it, as this warning suggests,
-# adds Moses punctuation normalisation and changes translations.
-warnings.filterwarnings("ignore", message="Recommended: pip install sacremoses")
-
 from fihris.config import (
     PINNED,
     RERANKER_TOKENIZER,
@@ -35,6 +31,10 @@ from fihris.config import (
     TRANSLATOR_SETS,
     Endpoints,
 )
+
+# The measured translators tokenize without sacremoses: installing it, as this warning suggests,
+# adds Moses punctuation normalisation and changes translations.
+warnings.filterwarnings("ignore", message="Recommended: pip install sacremoses")
 
 
 class Embedder(Protocol):

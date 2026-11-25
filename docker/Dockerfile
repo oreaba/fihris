@@ -31,5 +31,6 @@ CMD ["status"]
 FROM online AS offline
 ARG TRANSLATORS=opus-mt
 ENV HF_HOME=/models/hf FIHRIS_TRANSLATOR_MODELS=${TRANSLATORS}
-RUN fihris download-models --translators "${TRANSLATORS}" > /models/downloaded.json
+RUN fihris download-models --translators "${TRANSLATORS}" > /models/downloaded.json \
+ && chmod -R a+rX /models
 ENV HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
