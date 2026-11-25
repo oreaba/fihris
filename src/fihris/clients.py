@@ -5,8 +5,9 @@ They are only clients: nothing here starts, stops or reconfigures a server.
 - embeddings: ``/v1/embeddings``, vectors normalised to unit length;
 - reranking: token IDs from the reranker's own tokenizer, sent to ``/classify``, scored by the
   first class probability;
-- translation: opus-mt with beam search over one question at a time, on the GPU when there is
-  one.
+- translation: opus-mt with beam search over one question at a time, either through CTranslate2
+  (``CT2Translator``, the default: models converted once, no torch, on the CPU) or through
+  transformers and torch (``OpusTranslator``, on the GPU by default).
 """
 
 from __future__ import annotations
@@ -107,10 +108,14 @@ class OpusTranslator:
     time, so padding cannot change a translation."""
 
     def __init__(self, endpoints: Endpoints, paths: dict[str, Path] | None = None):
-        import torch
+        try:
+            import torch
+        except ImportError as error:
+            raise ImportError('FIHRIS_TRANSLATOR=torch needs torch: pip install "fihris[torch]"'
+                              ) from error
         from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
-        self.device = endpoints.translator_device
+        self.device = endpoints.translator_device or "cuda"
         if self.device != "cpu":
             self.gpu = check_gpu(endpoints.min_free_gpu_gib)
         self.models = {}
@@ -133,6 +138,90 @@ class OpusTranslator:
             ids = model.generate(**inputs, num_beams=PINNED.translation_beams,
                                  max_new_tokens=PINNED.translation_max_tokens)
         return tokenizer.decode(ids[0], skip_special_tokens=True)
+
+
+TOKENIZER_FILES = ("vocab.json", "source.spm", "target.spm", "tokenizer_config.json",
+                   "special_tokens_map.json")
+
+
+def converted_path(endpoints: Endpoints, repo: str) -> Path:
+    """Where ``fihris convert-translators`` puts ``repo`` in CTranslate2's format."""
+    return endpoints.translator_dir / repo.split("/")[-1]
+
+
+class CT2Translator:
+    """Both opus-mt models in CTranslate2's format (``fihris convert-translators``), float32, with
+    the same beam search as ``OpusTranslator`` and no torch. CPU by default: the ARM64 wheels on
+    PyPI have no GPU support. One lock per model, as in ``OpusTranslator``."""
+
+    def __init__(self, endpoints: Endpoints, paths: dict[str, Path] | None = None):
+        import ctranslate2
+        from transformers import MarianTokenizer
+
+        self.device = endpoints.translator_device or "cpu"
+        self.models = {}
+        for lang, (repo, token) in PINNED.translators.items():
+            path = (paths or {}).get(lang) or converted_path(endpoints, repo)
+            if not (path / "model.bin").is_file():
+                raise FileNotFoundError(
+                    f"no CTranslate2 copy of {repo} in {path}: run `fihris convert-translators` "
+                    "once where torch is installed, or copy its output folder here "
+                    "(FIHRIS_TRANSLATOR_DIR)")
+            tokenizer = MarianTokenizer.from_pretrained(path)
+            if token and token not in tokenizer.supported_language_codes:
+                raise ValueError(f"{token} is not a target language of {repo}")
+            translator = ctranslate2.Translator(str(path), device=self.device,
+                                                compute_type="float32")
+            self.models[lang] = (tokenizer, translator, token, threading.Lock())
+
+    def translate(self, text: str, source_lang: str) -> str:
+        tokenizer, translator, token, lock = self.models[source_lang]
+        source = f"{token} {text}" if token else text
+        tokens = tokenizer.convert_ids_to_tokens(
+            tokenizer.encode(source, max_length=PINNED.translation_max_tokens, truncation=True))
+        with lock:
+            result = translator.translate_batch(
+                [tokens], beam_size=PINNED.translation_beams,
+                max_decoding_length=PINNED.translation_max_tokens)[0]
+        return tokenizer.decode(tokenizer.convert_tokens_to_ids(result.hypotheses[0]),
+                                skip_special_tokens=True)
+
+
+def convert_translators(endpoints: Endpoints, out: Path | None = None,
+                        force: bool = False) -> list[dict]:
+    """Both opus-mt models from the local Hugging Face cache into CTranslate2's format, float32,
+    with their tokenizer files. Needs torch, once: ctranslate2's converter loads the model."""
+    import ctranslate2
+
+    report = []
+    for _lang, (repo, _token) in PINNED.translators.items():
+        source = snapshot(repo)
+        target = (out / repo.split("/")[-1]) if out else converted_path(endpoints, repo)
+        if (target / "model.bin").is_file() and not force:
+            report.append({"model": repo, "path": str(target), "converted": False})
+            continue
+        try:
+            converter = ctranslate2.converters.TransformersConverter(
+                str(source), copy_files=[f for f in TOKENIZER_FILES if (source / f).is_file()])
+            converter.convert(str(target), quantization="float32", force=True)
+        except ImportError as error:
+            raise ImportError("converting needs torch once: pip install torch, or run it where "
+                              "torch is installed (such as the vLLM container)") from error
+        (target / "fihris.json").write_text(json.dumps(
+            {"model": repo, "revision": source.name, "ctranslate2": ctranslate2.__version__,
+             "quantization": "float32"}, indent=1), encoding="utf-8")
+        report.append({"model": repo, "revision": source.name, "path": str(target),
+                       "converted": True})
+    return report
+
+
+def open_translator(endpoints: Endpoints) -> Translate:
+    """The translator ``FIHRIS_TRANSLATOR`` names: ``ct2`` (the default) or ``torch``."""
+    if endpoints.translator == "ct2":
+        return CT2Translator(endpoints)
+    if endpoints.translator == "torch":
+        return OpusTranslator(endpoints)
+    raise ValueError(f"FIHRIS_TRANSLATOR must be ct2 or torch, not {endpoints.translator!r}")
 
 
 def health(url: str, timeout: float = 5.0) -> bool:

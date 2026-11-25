@@ -30,6 +30,7 @@ dependencies = [
     "numpy>=1.26",
     "sqlalchemy>=2.0.36",
     "psycopg[binary]>=3.2",
+    "ctranslate2>=4.5",
     "transformers>=4.46",
     "sentencepiece>=0.2",
     "huggingface-hub>=0.26",
@@ -41,8 +42,8 @@ dependencies = [
 qdrant = [
     "qdrant-client>=1.12",
 ]
-# The opus-mt question translator runs locally on torch (CUDA when available).
-translate = [
+# The torch translator (FIHRIS_TRANSLATOR=torch), convert-translators and compare-translators.
+torch = [
     "torch>=2.4",
 ]
 # OCR fallback for pages the quality gate rejects. Tesseract 5 itself is installed outside pip.

@@ -70,7 +70,9 @@ class Endpoints:
     work_dir: Path = Path("artifacts/fihris")
     fonts_dir: Path = Path("fonts")
     tesseract_cmd: str | None = None
-    translator_device: str = "cuda"
+    translator: str = "ct2"
+    translator_dir: Path = Path("translators")
+    translator_device: str = ""
     min_free_gpu_gib: float = 2.0
     timeout_s: float = 120.0
 
@@ -91,6 +93,8 @@ class Endpoints:
             work_dir=Path(env("FIHRIS_WORK_DIR", str(base.work_dir))),
             fonts_dir=Path(env("FIHRIS_FONTS_DIR", str(base.fonts_dir))),
             tesseract_cmd=env("FIHRIS_TESSERACT_CMD") or None,
+            translator=env("FIHRIS_TRANSLATOR", base.translator),
+            translator_dir=Path(env("FIHRIS_TRANSLATOR_DIR", str(base.translator_dir))),
             translator_device=env("FIHRIS_TRANSLATOR_DEVICE", base.translator_device),
             min_free_gpu_gib=float(env("FIHRIS_MIN_FREE_GPU_GIB", base.min_free_gpu_gib)),
             timeout_s=float(env("FIHRIS_TIMEOUT_S", base.timeout_s)))

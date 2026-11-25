@@ -95,9 +95,9 @@ class Engine:
     @property
     def translator(self):
         if self._translator is None:
-            from fihris.clients import OpusTranslator
+            from fihris.clients import open_translator
 
-            self._translator = OpusTranslator(self.endpoints)
+            self._translator = open_translator(self.endpoints)
         return self._translator
 
     # --- the live build -------------------------------------------------------------------

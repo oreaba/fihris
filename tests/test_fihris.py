@@ -416,6 +416,16 @@ def test_same_ranking_allows_only_near_tie_swaps():
     assert not same_ranking(ref, [(k, 0) for k in "abc"], scores.get)
 
 
+def test_translator_is_ct2_by_default_and_names_a_missing_conversion(tmp_path):
+    from fihris.clients import CT2Translator, open_translator
+
+    assert Endpoints().translator == "ct2"
+    with pytest.raises(FileNotFoundError, match="convert-translators"):
+        CT2Translator(Endpoints(translator_dir=tmp_path / "none"))
+    with pytest.raises(ValueError, match="ct2 or torch"):
+        open_translator(Endpoints(translator="marian"))
+
+
 def test_pgvector_needs_postgresql_and_a_known_store(tmp_path):
     db = engine_for(f"sqlite:///{tmp_path / 's.db'}")
     with pytest.raises(ValueError, match="PostgreSQL"):

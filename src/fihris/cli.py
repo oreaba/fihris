@@ -292,6 +292,68 @@ def cmd_compare_stores(args) -> int:
     return 0 if verdicts["different"] == 0 else 1
 
 
+def cmd_convert_translators(args) -> int:
+    """Both opus-mt models from the Hugging Face cache into CTranslate2's format, for the default
+    translator. Needs torch, once."""
+    from fihris.clients import convert_translators
+
+    _print({"translators": convert_translators(Endpoints.from_env(), args.out, args.force)})
+    return 0
+
+
+def cmd_compare_translators(args) -> int:
+    """The torch and CTranslate2 translators on the same questions: identical translations, and,
+    for those that differ, whether retrieval's sources change. Needs torch and, unless
+    ``--translations-only``, the whole pipeline."""
+    from fihris.clients import CT2Translator, OpusTranslator
+    from fihris.retrieve import Retriever, detect_language
+
+    endpoints = Endpoints.from_env()
+    with args.questions.open(encoding="utf-8") as handle:
+        questions = [line.strip() for line in handle if line.strip()]
+    translators = {"torch": OpusTranslator(endpoints), "ct2": CT2Translator(endpoints)}
+    times: dict[str, list[float]] = {name: [] for name in translators}
+    differing = []
+    for i, question in enumerate(questions):
+        lang = detect_language(question)
+        out = {}
+        for name, translator in translators.items():
+            start = time.perf_counter()
+            out[name] = translator.translate(question, lang)
+            times[name].append(1000 * (time.perf_counter() - start))
+        if out["torch"] != out["ct2"]:
+            differing.append(i)
+    report: dict = {"questions": len(questions),
+                    "translations_identical": len(questions) - len(differing),
+                    "differing_questions": differing,
+                    "translate_ms": {name: _percentiles(ms) for name, ms in times.items()}}
+    if differing and not args.translations_only:
+        engine = _engine(args)
+        if engine.chunks is None:
+            print("no active build", file=sys.stderr)
+            return 2
+        sources = {"identical": 0, "same_sources_other_order": 0, "different": 0}
+        changed = []
+        for i in differing:
+            lists = {}
+            for name, translator in translators.items():
+                retriever = Retriever(engine.chunks, engine.index, engine.embedder,
+                                      engine.scorer, translator)
+                result = retriever.retrieve(questions[i], Principal.unrestricted())
+                lists[name] = [(s.doc_id, s.page, s.chunk) for s in result.sources]
+            if lists["torch"] == lists["ct2"]:
+                sources["identical"] += 1
+            elif sorted(lists["torch"]) == sorted(lists["ct2"]):
+                sources["same_sources_other_order"] += 1
+            else:
+                sources["different"] += 1
+                changed.append(i)
+        report["sources_of_differing_questions"] = sources
+        report["questions_with_different_sources"] = changed
+    _print(report)
+    return 0
+
+
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="fihris", description="Fihris: ingestion, storage and "
                                 "retrieval of Arabic and English documents.")
@@ -343,6 +405,18 @@ def parser() -> argparse.ArgumentParser:
     s.add_argument("--pgvector-url", help="PostgreSQL URL for the pgvector side (default: the "
                    "fihris database, which must then be PostgreSQL)")
     s.set_defaults(run=cmd_compare_stores)
+    s = sub.add_parser("convert-translators", help="the opus-mt models into CTranslate2's "
+                       "format, for the default translator (needs torch, once)")
+    s.add_argument("--out", type=Path, help="folder for the converted models (default "
+                   "FIHRIS_TRANSLATOR_DIR)")
+    s.add_argument("--force", action="store_true", help="convert again over an existing copy")
+    s.set_defaults(run=cmd_convert_translators)
+    s = sub.add_parser("compare-translators", help="the torch and CTranslate2 translators on "
+                       "the same questions, and the sources retrieval returns with each")
+    s.add_argument("questions", type=Path, help="one question per line")
+    s.add_argument("--translations-only", action="store_true",
+                   help="compare the translations only, without retrieval")
+    s.set_defaults(run=cmd_compare_translators)
     return p
 
 
