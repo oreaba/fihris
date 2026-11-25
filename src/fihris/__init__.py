@@ -2,6 +2,6 @@
 stores their chunks and vectors, and retrieves numbered, access-filtered sources for a question.
 It stops at retrieval: answering is the caller's job."""
 
-__version__ = "0.5"
+__version__ = "0.6"
 
 __all__ = ["__version__"]

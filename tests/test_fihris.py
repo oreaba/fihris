@@ -430,12 +430,46 @@ def test_translator_is_ct2_by_default_and_names_what_is_missing(tmp_path, monkey
         raise OSError(repo)
 
     monkeypatch.setattr(clients, "snapshot", never_downloaded)
-    with pytest.raises(FileNotFoundError, match="download-translators"):
+    with pytest.raises(FileNotFoundError, match="download-models"):
         clients.CT2Translator(Endpoints(translator_models="tc-big"))
     with pytest.raises(ValueError, match="FIHRIS_TRANSLATOR_MODELS"):
         clients.CT2Translator(Endpoints(translator_models="nllb"))
     with pytest.raises(ValueError, match="ct2, torch or server"):
         clients.open_translator(Endpoints(translator="marian"))
+
+
+def test_download_models_fetches_translators_and_the_reranker_tokenizer(tmp_path, monkeypatch):
+    import huggingface_hub
+
+    from fihris import cli, clients
+    from fihris.config import RERANKER_TOKENIZER, TRANSLATOR_SETS
+
+    fetched = []
+
+    def fake_download(repo, revision=None, allow_patterns=None):
+        fetched.append((repo, revision, allow_patterns))
+        return str(tmp_path)
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_download)
+    report = clients.download_models("opus-mt")
+    assert [r["repo"] for r in report] == [s["model"] for s in TRANSLATOR_SETS["opus-mt"].values()
+                                           ] + [PINNED.reranker]
+    assert fetched[-1] == (PINNED.reranker, RERANKER_TOKENIZER["revision"],
+                           RERANKER_TOKENIZER["patterns"])
+    assert len(clients.download_models("tc-big")) == 4
+    assert cli.main(["download-translators", "--models", "opus-mt"]) == 0
+
+    tried = []
+
+    def unpinned_only(repo, revision=None, allow_patterns=None):
+        tried.append(revision)
+        if revision:
+            raise OSError("not at that revision")
+        return tmp_path
+
+    monkeypatch.setattr(clients, "snapshot", unpinned_only)
+    assert clients.reranker_tokenizer() == tmp_path
+    assert tried == [RERANKER_TOKENIZER["revision"], None]
 
 
 def test_server_translator_sends_the_cards_prompt_greedy(monkeypatch):

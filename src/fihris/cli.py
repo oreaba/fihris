@@ -292,12 +292,13 @@ def cmd_compare_stores(args) -> int:
     return 0 if verdicts["different"] == 0 else 1
 
 
-def cmd_download_translators(args) -> int:
-    """A ready-made translator set into the Hugging Face cache, at its pinned revisions."""
-    from fihris.clients import download_translators
+def cmd_download_models(args) -> int:
+    """Everything Fihris reads from the Hugging Face cache, at pinned revisions: a ready-made
+    translator set and the reranker's tokenizer files."""
+    from fihris.clients import download_models
 
-    name = args.models or Endpoints.from_env().translator_models
-    _print({"models": name, "downloaded": download_translators(name)})
+    name = args.translators or Endpoints.from_env().translator_models
+    _print({"translators": name, "downloaded": download_models(name)})
     return 0
 
 
@@ -436,11 +437,12 @@ def parser() -> argparse.ArgumentParser:
     s.set_defaults(run=cmd_compare_stores)
     from fihris.config import TRANSLATOR_SETS
 
-    s = sub.add_parser("download-translators", help="a ready-made translator set into the "
+    s = sub.add_parser("download-models", aliases=["download-translators"],
+                       help="the translator models and the reranker's tokenizer into the "
                        "Hugging Face cache (the only step that uses the network)")
-    s.add_argument("--models", choices=sorted(TRANSLATOR_SETS),
-                   help="the set (default FIHRIS_TRANSLATOR_MODELS)")
-    s.set_defaults(run=cmd_download_translators)
+    s.add_argument("--translators", "--models", choices=sorted(TRANSLATOR_SETS),
+                   help="the translator set (default FIHRIS_TRANSLATOR_MODELS)")
+    s.set_defaults(run=cmd_download_models)
     s = sub.add_parser("convert-translators", help="the opus-mt models into CTranslate2's "
                        "format, for FIHRIS_TRANSLATOR_DIR (needs torch, once)")
     s.add_argument("--out", type=Path, help="folder for the converted models (default "

@@ -50,10 +50,10 @@ These settings are pinned in [`config.py`](https://github.com/oreaba/fihris/blob
 | Qdrant, only when it is the vector store | `127.0.0.1:6333` (gRPC 6334) | `FIHRIS_QDRANT_HOST`, `FIHRIS_QDRANT_PORT`, `FIHRIS_QDRANT_GRPC_PORT` |
 | Translator: `ct2`, `server` or `torch` (see [Translator](#translator)) | `ct2` | `FIHRIS_TRANSLATOR` |
 | Translation server, for `server` (OpenAI-compatible `/v1/chat/completions`, and its served model name) | `http://127.0.0.1:8102`, `hy-mt3-1.8b` | `FIHRIS_TRANSLATE_URL`, `FIHRIS_TRANSLATE_MODEL` |
-| Translator models: a ready-made set in the Hugging Face cache (`fihris download-translators`) | `opus-mt` | `FIHRIS_TRANSLATOR_MODELS` |
+| Translator models: a ready-made set in the Hugging Face cache (`fihris download-models`) | `opus-mt` | `FIHRIS_TRANSLATOR_MODELS` |
 | Or your own converted copies (`fihris convert-translators`) | unset | `FIHRIS_TRANSLATOR_DIR` |
 | Translator device | `cpu` for `ct2`, `cuda` for `torch` | `FIHRIS_TRANSLATOR_DEVICE` |
-| Reranker tokenizer (`BAAI/bge-reranker-v2-m3`) in the Hugging Face cache: fihris tokenizes the pairs it sends | | `HF_HOME` |
+| Reranker tokenizer (`BAAI/bge-reranker-v2-m3`, tokenizer files only) in the Hugging Face cache (`fihris download-models`): fihris tokenizes the pairs it sends | pinned revision | `HF_HOME` |
 | Fonts folder for Arabic PDFs (see [pdf-ar](https://github.com/oreaba/pdf-ar#fonts)) | `fonts` | `FIHRIS_FONTS_DIR` |
 | Documents folder for `import-pages` | `documents` | `FIHRIS_CORPUS_ROOT` |
 | Work folder for uploads and temporary files | `artifacts/fihris` | `FIHRIS_WORK_DIR` |
@@ -83,12 +83,12 @@ export FIHRIS_DATABASE_URL=postgresql+psycopg://fihris:change-me@127.0.0.1:5432/
 
 `fihris init-db` then creates the `fihris` schema, its tables and the `vector` extension (its database role must be allowed to create it).
 
-Search translates every question: run `fihris download-translators` once to fetch the ready-made translator models (see [Translator](#translator)).
+Then run `fihris download-models` once. It fetches everything Fihris reads from the Hugging Face cache, at pinned revisions: the ready-made translator models (see [Translator](#translator)) and the reranker's tokenizer files (Fihris tokenizes the pairs it sends to the reranker server). It is the only step that uses the network; on an offline machine, run it where there is network and copy the Hugging Face cache across.
 
 ## Use
 
 ```
-fihris download-translators                       # once: the translator models
+fihris download-models                            # once: translator models and reranker tokenizer
 fihris init-db
 fihris ingest documents/ --visible-to-all          # files or folders, one job per file
 fihris search "How many days of annual leave do staff get?" --text
@@ -128,7 +128,7 @@ for source in result.sources:
 
 The question is translated into the other language with beam search of 4, one question at a time, by CTranslate2 (`FIHRIS_TRANSLATOR=ct2`, the default) on the CPU. No torch: the `ctranslate2` package is 2 MiB on ARM64 Linux and about 25 MiB on x86-64, against about 500 MiB for torch alone. The ARM64 wheels on PyPI have no GPU support.
 
-The models come ready-made from the Hugging Face Hub, pinned to the revisions tested; nothing is converted. `fihris download-translators` fetches the set `FIHRIS_TRANSLATOR_MODELS` names into the Hugging Face cache, and is the only step that uses the network:
+The models come ready-made from the Hugging Face Hub, pinned to the revisions tested; nothing is converted. `fihris download-models` fetches the set `FIHRIS_TRANSLATOR_MODELS` names (or `--translators tc-big`) into the Hugging Face cache, with the reranker's tokenizer:
 
 | Set | English to Arabic | Arabic to English | Size | FLORES-200 devtest chrF++, en→ar / ar→en |
 |---|---|---|---|---|

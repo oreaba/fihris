@@ -24,6 +24,7 @@ import numpy as np
 
 from fihris.config import (
     PINNED,
+    RERANKER_TOKENIZER,
     SERVER_TRANSLATION,
     TOKENIZER_PATTERNS,
     TRANSLATOR_SETS,
@@ -74,13 +75,28 @@ class EmbeddingClient:
         return vectors / np.linalg.norm(vectors, axis=1, keepdims=True)
 
 
+def reranker_tokenizer() -> Path:
+    """The reranker's tokenizer files in the Hugging Face cache: the pinned revision, as
+    ``fihris download-models`` fetches it, or else whatever revision ``main`` points to."""
+    spec = RERANKER_TOKENIZER
+    try:
+        return snapshot(PINNED.reranker, spec["revision"], spec["patterns"])
+    except Exception:  # noqa: BLE001 - fall back to an older, unpinned download
+        pass
+    try:
+        return snapshot(PINNED.reranker)
+    except Exception as error:  # noqa: BLE001 - any miss means it was never downloaded
+        raise FileNotFoundError(f"{PINNED.reranker}'s tokenizer is not in the Hugging Face "
+                                "cache: run `fihris download-models`") from error
+
+
 class RerankClient:
     def __init__(self, endpoints: Endpoints, tokenizer_path: Path | None = None,
                  model: str = PINNED.reranker_served):
         from transformers import AutoTokenizer
 
         self.url, self.model, self.timeout = endpoints.rerank_url, model, endpoints.timeout_s
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path or snapshot(PINNED.reranker))
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path or reranker_tokenizer())
 
     def inputs(self, pairs: Sequence[tuple[str, str]]) -> list[list[int]]:
         return self.tokenizer([q for q, _ in pairs], [t for _, t in pairs],
@@ -171,7 +187,7 @@ def _cached(repo: str, revision: str, allow_patterns: list[str] | None = None) -
         return snapshot(repo, revision, allow_patterns)
     except Exception as error:  # noqa: BLE001 - any miss means it was never downloaded
         raise FileNotFoundError(f"{repo} at {revision[:12]} is not in the Hugging Face cache: "
-                                "run `fihris download-translators`") from error
+                                "run `fihris download-models`") from error
 
 
 def translator_dirs(endpoints: Endpoints) -> dict[str, tuple[Path, Path, str, str]]:
@@ -197,21 +213,25 @@ def translator_dirs(endpoints: Endpoints) -> dict[str, tuple[Path, Path, str, st
     return out
 
 
-def download_translators(name: str) -> list[dict]:
-    """The ready-made set ``name`` into the Hugging Face cache, at its pinned revisions. The only
-    step that uses the network; translating never does."""
+def download_models(translators: str) -> list[dict]:
+    """Everything Fihris reads from the Hugging Face cache, at pinned revisions: the ready-made
+    translator set ``translators`` and the reranker's tokenizer files. The only step that uses
+    the network; nothing else does."""
     from huggingface_hub import snapshot_download
 
+    wanted = []
+    for spec in translator_set(translators).values():
+        wanted.append((spec["model"], spec["revision"], None))
+        if "tokenizer" in spec:
+            wanted.append((spec["tokenizer"], spec["tokenizer_revision"], TOKENIZER_PATTERNS))
+    wanted.append((PINNED.reranker, RERANKER_TOKENIZER["revision"],
+                   RERANKER_TOKENIZER["patterns"]))
     report = []
-    for spec in translator_set(name).values():
-        for repo, revision, patterns in (
-                (spec["model"], spec["revision"], None),
-                (spec.get("tokenizer"), spec.get("tokenizer_revision"), TOKENIZER_PATTERNS)):
-            if repo:
-                path = Path(snapshot_download(repo, revision=revision, allow_patterns=patterns))
-                report.append({"repo": repo, "revision": revision, "path": str(path),
-                               "mib": round(sum(f.stat().st_size for f in path.rglob("*")
-                                                if f.is_file()) / 2**20)})
+    for repo, revision, patterns in wanted:
+        path = Path(snapshot_download(repo, revision=revision, allow_patterns=patterns))
+        report.append({"repo": repo, "revision": revision, "path": str(path),
+                       "mib": round(sum(f.stat().st_size for f in path.rglob("*")
+                                        if f.is_file()) / 2**20)})
     return report
 
 

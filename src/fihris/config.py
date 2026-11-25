@@ -35,6 +35,11 @@ TRANSLATOR_SETS = {
 }
 TOKENIZER_PATTERNS = ["*.spm", "vocab.json", "tokenizer_config.json", "special_tokens_map.json"]
 
+# The reranker runs on a server, but Fihris tokenizes the pairs it sends, so it needs the
+# reranker's tokenizer files locally: the revision Stage 6 used, without the model weights.
+RERANKER_TOKENIZER = {"revision": "953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e",
+                      "patterns": ["*.json", "*.model"]}
+
 # A translation model served behind an OpenAI-compatible chat API (FIHRIS_TRANSLATOR=server):
 # Hy-MT3's own prompt (its model card), greedy, with the card's repetition penalty.
 SERVER_TRANSLATION = {
