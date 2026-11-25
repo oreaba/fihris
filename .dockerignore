@@ -1,0 +1,9 @@
+.git
+.venv
+build
+dist
+artifacts
+tests
+**/__pycache__
+**/*.egg-info
+ARCHITECTURE.md
