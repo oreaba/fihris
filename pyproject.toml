@@ -36,7 +36,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# PostgreSQL instead of SQLite.
+# PostgreSQL instead of SQLite, and the pgvector store (FIHRIS_VECTOR_STORE=pgvector).
 postgres = [
     "psycopg[binary]>=3.2",
 ]

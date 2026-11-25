@@ -31,7 +31,7 @@ from fihris.library import NotFound, document_groups
 from fihris.principal import Principal
 from fihris.retrieve import Retrieval, Retriever, detect_language
 from fihris.units import Unit, fingerprint
-from fihris.vectors import LIVE_ALIAS, Point, collection_name
+from fihris.vectors import Point, collection_name, open_index
 
 EMBED_BATCH = 64
 STEPS = {"ingest": ["extract", "quality_gate", "ocr", "chunk", "embed", "index"],
@@ -73,9 +73,7 @@ class Engine:
     @property
     def index(self):
         if self._index is None:
-            from fihris.vectors import QdrantIndex
-
-            self._index = QdrantIndex(self.endpoints, LIVE_ALIAS)
+            self._index = open_index(self.endpoints, self.make_session.kw["bind"])
         return self._index
 
     @property

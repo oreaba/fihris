@@ -1,9 +1,12 @@
 """Fihris: retrieval, access filtering, builds, the library, ingestion and the extraction queue.
-Model servers are replaced by deterministic fakes."""
+Model servers are replaced by deterministic fakes. The engine tests run on SQLite with the NumPy
+store, and again on PostgreSQL with pgvector when ``FIHRIS_TEST_PG_URL`` names a database the
+tests may wipe (its ``fihris`` schema is dropped before each test)."""
 
 from __future__ import annotations
 
 import hashlib
+import os
 
 import numpy as np
 import pytest
@@ -17,7 +20,14 @@ from fihris.library import NotFound, Query, detail, locate, page_view, search, u
 from fihris.principal import Principal
 from fihris.retrieve import Retriever, fit
 from fihris.units import Unit
-from fihris.vectors import MemoryIndex, Point, collection_name
+from fihris.vectors import (
+    MemoryIndex,
+    PgVectorIndex,
+    Point,
+    collection_name,
+    open_index,
+    same_ranking,
+)
 
 DIM = PINNED.vector_dim
 
@@ -146,10 +156,26 @@ def test_principal_cannot_widen_itself():
 
 # --- the engine and the library ---------------------------------------------------------------
 
-@pytest.fixture()
-def engine(tmp_path):
-    db = engine_for(f"sqlite:///{tmp_path / 'f.db'}")
-    create_schema(db)
+def fresh_postgres():
+    url = os.environ.get("FIHRIS_TEST_PG_URL")
+    if not url:
+        pytest.skip("FIHRIS_TEST_PG_URL is not set")
+    db = engine_for(url)
+    with db.begin() as conn:
+        conn.exec_driver_sql("DROP SCHEMA IF EXISTS fihris CASCADE")
+    return db
+
+
+@pytest.fixture(params=["memory", "pgvector"])
+def engine(request, tmp_path):
+    if request.param == "pgvector":
+        db = fresh_postgres()
+        create_schema(db)
+        index = PgVectorIndex(db)
+    else:
+        db = engine_for(f"sqlite:///{tmp_path / 'f.db'}")
+        create_schema(db)
+        index = MemoryIndex()
     make = sessions(db)
     with make() as session:
         for doc_id, title, lang, groups, everyone in [
@@ -164,13 +190,15 @@ def engine(tmp_path):
             if session.get(Page, (d, p)) is None:
                 session.add(Page(doc_id=d, page=p, status="ok", text=t.split("\n")[-1], md=""))
         session.commit()
-    eng = Engine(Endpoints(work_dir=tmp_path / "work"), make, index=MemoryIndex(),
+    eng = Engine(Endpoints(work_dir=tmp_path / "work"), make, index=index,
                  embedder=FakeEmbedder(), scorer=FakeScorer(), translator=FakeTranslator())
     rows = [{"doc_id": d, "page": p, "chunk": c, "text": t, "headings": []}
             for d, p, c, t in TEXTS]
     eng.create_build(rows, FakeEmbedder().embed([r["text"] for r in rows]), None, "test",
                      activate=True, build_id="build-test")
-    return eng
+    yield eng
+    eng.jobs.shutdown(wait=True)
+    db.dispose()
 
 
 def test_text_with_nul_round_trips_and_keeps_fingerprint(tmp_path):
@@ -192,7 +220,7 @@ def test_text_with_nul_round_trips_and_keeps_fingerprint(tmp_path):
 
 def test_build_is_active_and_searchable(engine):
     assert engine.build.build_id == "build-test"
-    assert engine.index.live == collection_name("build-test")
+    assert engine.index.count() == engine.index.count(collection_name("build-test")) == len(TEXTS)
     result = engine.retrieve("annual leave", Principal.for_groups(["hr"], False))
     assert result.sources and {s.doc_id for s in result.sources} <= {"d1", "d2", "d3"}
 
@@ -375,3 +403,77 @@ def test_doc_ids_are_stable_across_separators_and_unicode_forms():
 
     name = "سياسة الإجازات.pdf"
     assert make_doc_id("hr\\" + name) == make_doc_id("hr/" + unicodedata.normalize("NFD", name))
+
+
+# --- the vector stores --------------------------------------------------------------------------
+
+def test_same_ranking_allows_only_near_tie_swaps():
+    scores = {"a": 0.9, "b": 0.8, "c": 0.8 + 5e-6, "d": 0.7}
+    ref = [(k, scores[k]) for k in "abcd"]
+    assert same_ranking(ref, [(k, 0) for k in "acbd"], scores.get)
+    assert not same_ranking(ref, [(k, 0) for k in "abdc"], scores.get)
+    assert not same_ranking(ref, [(k, 0) for k in "abbd"], scores.get)
+    assert not same_ranking(ref, [(k, 0) for k in "abc"], scores.get)
+
+
+def test_pgvector_needs_postgresql_and_a_known_store(tmp_path):
+    db = engine_for(f"sqlite:///{tmp_path / 's.db'}")
+    with pytest.raises(ValueError, match="PostgreSQL"):
+        open_index(Endpoints(vector_store="pgvector"), db)
+    with pytest.raises(ValueError, match="qdrant or pgvector"):
+        open_index(Endpoints(vector_store="faiss"), db)
+
+
+def test_pgvector_matches_the_numpy_reference_through_updates():
+    db = fresh_postgres()
+    rng = np.random.default_rng(7)
+    groups = [("all",), ("hr",), ("board",), ("hr", "board")]
+    points = []
+    for d in range(30):
+        g = groups[d % len(groups)]
+        for c in range(12):
+            v = rng.standard_normal(DIM).astype(np.float32)
+            points.append(Point(f"doc{d:02d}", 1 + c // 4, c % 4, v / np.linalg.norm(v),
+                                "en" if d % 2 else "ar", g, searchable=d % 7 != 3))
+    queries = rng.standard_normal((6, DIM)).astype(np.float32)
+    queries /= np.linalg.norm(queries, axis=1, keepdims=True)
+    principals = [Principal.unrestricted(), Principal.for_groups(["hr"], False),
+                  Principal.for_groups(["hr"], True), Principal.for_groups(["nobody"], False)]
+    pg, ref = PgVectorIndex(db), MemoryIndex()
+
+    def same(k=100):
+        for principal in principals:
+            for a, b in zip(ref.search(queries, principal, k), pg.search(queries, principal, k),
+                            strict=True):
+                assert [key for key, _ in a] == [key for key, _ in b]
+                assert np.allclose([s for _, s in a], [s for _, s in b], atol=1e-5)
+
+    for store in (ref, pg):
+        store.create("fihris_build_a", points)
+        store.activate("fihris_build_a")
+        with pytest.raises(ValueError, match="already exists"):
+            store.create("fihris_build_a", [])
+    same()
+    same(k=5)
+    keys = [p.key for p in points[:40]]
+    assert all(np.array_equal(pg.vectors("fihris_build_a", keys)[p.key], p.vector)
+               for p in points[:40])
+
+    replacement = [Point(p.doc_id, p.page, p.chunk, -p.vector, p.lang, p.groups)
+                   for p in points if p.doc_id == "doc05"]
+    for store in (ref, pg):
+        store.delete_document("fihris_build_a", "doc04")
+        store.set_access("fihris_build_a", "doc01", ("all",), True)
+        store.set_access("fihris_build_a", "doc02", ("hr",), False)
+        store.upsert("fihris_build_a", replacement)
+    same()
+    assert pg.count() == ref.count() == len(points) - 12
+
+    for store in (ref, pg):
+        store.create("fihris_build_b", points[:24])
+        store.activate("fihris_build_b")
+    same()
+    assert pg.count() == 24 and pg.count("fihris_build_a") == len(points) - 12
+    pg.drop("fihris_build_a")
+    assert pg.count("fihris_build_a") == 0 and pg.healthy()
+    db.dispose()

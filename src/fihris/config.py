@@ -65,6 +65,7 @@ class Endpoints:
     qdrant_port: int = 6333
     qdrant_grpc_port: int = 6334
     database_url: str = "sqlite:///artifacts/fihris/fihris.db"
+    vector_store: str = "qdrant"
     corpus_root: Path = Path("documents")
     work_dir: Path = Path("artifacts/fihris")
     fonts_dir: Path = Path("fonts")
@@ -85,6 +86,7 @@ class Endpoints:
             qdrant_port=int(env("FIHRIS_QDRANT_PORT", base.qdrant_port)),
             qdrant_grpc_port=int(env("FIHRIS_QDRANT_GRPC_PORT", base.qdrant_grpc_port)),
             database_url=env("FIHRIS_DATABASE_URL", base.database_url),
+            vector_store=env("FIHRIS_VECTOR_STORE", base.vector_store),
             corpus_root=Path(env("FIHRIS_CORPUS_ROOT", str(base.corpus_root))),
             work_dir=Path(env("FIHRIS_WORK_DIR", str(base.work_dir))),
             fonts_dir=Path(env("FIHRIS_FONTS_DIR", str(base.fonts_dir))),

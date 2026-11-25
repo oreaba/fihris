@@ -204,6 +204,88 @@ def cmd_reindex(args) -> int:
         time.sleep(2)
 
 
+def _percentiles(ms: list[float]) -> dict:
+    import numpy as np
+
+    return {"p50": round(float(np.percentile(ms, 50)), 1),
+            "p95": round(float(np.percentile(ms, 95)), 1)} if ms else {}
+
+
+def cmd_compare_stores(args) -> int:
+    """The live build's dense search in Qdrant and in pgvector, question by question: lists
+    compared under EXP-024's matching rule, and the time of each search. ``--copy`` first copies
+    the live build's vectors from Qdrant into pgvector, unchanged, under the same collection."""
+    import numpy as np
+
+    from fihris.vectors import open_index, same_ranking
+
+    engine = _engine(args)
+    if engine.build is None:
+        print("no active build", file=sys.stderr)
+        return 2
+    db, build = engine.make_session.kw["bind"], engine.build
+    collection = build.collection
+    qdrant = open_index(engine.endpoints, db, "qdrant")
+    pg = open_index(engine.endpoints, engine_for(args.pgvector_url) if args.pgvector_url else db,
+                    "pgvector")
+    with engine.make_session() as session:
+        rows = [{"doc_id": c.doc_id, "page": c.page, "chunk": c.chunk, "text": c.text}
+                for c in session.scalars(select(Chunk).where(Chunk.build_id == build.build_id)
+                                         .order_by(Chunk.ordinal)).all()]
+        access = engine.access_map(session)
+    keys = [(r["doc_id"], r["page"], r["chunk"]) for r in rows]
+    stored = qdrant.vectors(collection, keys)
+    if len(stored) != len(keys):
+        print(f"Qdrant holds {len(stored)} of the build's {len(keys)} vectors", file=sys.stderr)
+        return 2
+    report: dict = {"build": build.build_id, "chunks": len(keys)}
+    if args.copy:
+        pg.drop(collection)
+        pg.create(collection, engine.points(rows, np.stack([stored[k] for k in keys]), access))
+        pg.activate(collection)
+        report["copied"] = len(keys)
+    report["counts"] = {"qdrant": qdrant.count(), "pgvector": pg.count()}
+    if report["counts"]["pgvector"] != len(keys):
+        _print(report)
+        print("pgvector does not hold the live build; run with --copy", file=sys.stderr)
+        return 2
+
+    with args.questions.open(encoding="utf-8") as handle:
+        questions = [line.strip() for line in handle if line.strip()]
+    texts = list(questions)
+    if not args.no_translate:
+        from fihris.retrieve import detect_language
+
+        texts += [engine.translator.translate(q, detect_language(q)) for q in questions]
+    queries = engine.embedder.embed([PINNED.query_instruction + t for t in texts])
+    principal = (Principal.for_groups(args.groups, False) if args.groups
+                 else Principal.unrestricted())
+    qdrant.search(queries[:1], principal)
+    pg.search(queries[:1], principal)
+    verdicts = {"identical": 0, "near_ties_swapped": 0, "different": 0}
+    times: dict[str, list[float]] = {"qdrant": [], "pgvector": []}
+    different = []
+    for i, query in enumerate(queries):
+        lists = {}
+        for name, store in (("qdrant", qdrant), ("pgvector", pg)):
+            start = time.perf_counter()
+            lists[name] = store.search(query[None, :], principal)[0]
+            times[name].append(1000 * (time.perf_counter() - start))
+        a, b = lists["qdrant"], lists["pgvector"]
+        if [k for k, _ in a] == [k for k, _ in b]:
+            verdicts["identical"] += 1
+        elif same_ranking(a, b, lambda key, q=query: float(stored[key] @ q)):
+            verdicts["near_ties_swapped"] += 1
+        else:
+            verdicts["different"] += 1
+            different.append(i)
+    report.update({"queries": len(queries), "principal_groups": sorted(args.groups) or "all",
+                   **verdicts, "different_queries": different,
+                   "search_ms": {name: _percentiles(ms) for name, ms in times.items()}})
+    _print(report)
+    return 0 if verdicts["different"] == 0 else 1
+
+
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="fihris", description="Fihris: ingestion, storage and "
                                 "retrieval of Arabic and English documents.")
@@ -243,6 +325,18 @@ def parser() -> argparse.ArgumentParser:
     s.set_defaults(run=cmd_ingest)
     sub.add_parser("reindex", help="re-chunk every document into a new build").set_defaults(
         run=cmd_reindex)
+    s = sub.add_parser("compare-stores", help="the live build's dense search in Qdrant and in "
+                       "pgvector: same lists, and the time of each")
+    s.add_argument("questions", type=Path, help="one question per line")
+    s.add_argument("--copy", action="store_true",
+                   help="first copy the live build's vectors from Qdrant into pgvector")
+    s.add_argument("--groups", nargs="*", default=[],
+                   help="search as a principal with these groups (default: unrestricted)")
+    s.add_argument("--no-translate", action="store_true",
+                   help="search the questions only, not their translations too")
+    s.add_argument("--pgvector-url", help="PostgreSQL URL for the pgvector side (default: the "
+                   "fihris database, which must then be PostgreSQL)")
+    s.set_defaults(run=cmd_compare_stores)
     return p
 
 

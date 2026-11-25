@@ -1,14 +1,18 @@
 """Dense search over one index build, with the access filter applied in the store.
 
 ``QdrantIndex``: one collection per build, exact search by inner product over unit vectors; the
-live build is reached through an alias, switched only when a build is complete. ``MemoryIndex``
-is the same contract in NumPy, for tests.
+live build is reached through an alias, switched only when a build is complete. ``PgVectorIndex``
+is the same contract in PostgreSQL with pgvector, in fihris's own database: one table per build,
+a one-row alias table, and a sequential scan (no vector index), so search stays exact.
+``MemoryIndex`` is the same contract in NumPy, for tests.
 """
 
 from __future__ import annotations
 
 import hashlib
+import re
 from collections.abc import Iterable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import numpy as np
@@ -44,6 +48,29 @@ class Point:
 
 def collection_name(build_id: str) -> str:
     return "fihris_" + build_id.replace("-", "_")
+
+
+def same_ranking(reference: Sequence[tuple[Key, float]], candidate: Sequence[tuple[Key, float]],
+                 score_of, tolerance: float = 1e-5) -> bool:
+    """EXP-024's matching rule: at every rank, the reference score of the candidate's chunk is
+    within ``tolerance`` of the reference score at that rank, and no chunk repeats. Near-ties
+    may swap, even across the last rank; nothing else may differ."""
+    keys = [k for k, _ in candidate]
+    if len(keys) != len(reference) or len(set(keys)) != len(keys):
+        return False
+    return all(abs(score_of(r) - score_of(c)) <= tolerance
+               for (r, _), c in zip(reference, keys, strict=True))
+
+
+def open_index(endpoints: Endpoints, db, store: str | None = None, collection: str = LIVE_ALIAS):
+    """The vector store ``FIHRIS_VECTOR_STORE`` names: ``qdrant`` (the default) or ``pgvector``,
+    which keeps the vectors in the database ``db`` that holds everything else."""
+    store = store or endpoints.vector_store
+    if store == "qdrant":
+        return QdrantIndex(endpoints, collection)
+    if store == "pgvector":
+        return PgVectorIndex(db, collection)
+    raise ValueError(f"FIHRIS_VECTOR_STORE must be qdrant or pgvector, not {store!r}")
 
 
 class QdrantIndex:
@@ -152,6 +179,168 @@ class QdrantIndex:
 
     def close(self) -> None:
         self.client.close()
+
+
+_TABLE_NAME = re.compile(r"^[a-z0-9_]{1,63}$")
+
+
+def _literal(vector: np.ndarray) -> str:
+    """pgvector's text form. ``repr`` of each float32 widened to a double parses back to the
+    same float32, so stored vectors equal the embedded ones bit for bit."""
+    return "[" + ",".join(map(repr, np.asarray(vector, dtype=np.float32).tolist())) + "]"
+
+
+def _parse(text: str) -> np.ndarray:
+    return np.array(text[1:-1].split(","), dtype=np.float32)
+
+
+class PgVectorIndex:
+    """One table per build in schema ``fihris``, the live alias in ``fihris.vector_alias``. No
+    vector index is created: every search scans the build, as the exact Qdrant search does."""
+
+    def __init__(self, db, collection: str = LIVE_ALIAS):
+        from sqlalchemy import text
+
+        if db.dialect.name != "postgresql":
+            raise ValueError("FIHRIS_VECTOR_STORE=pgvector needs a PostgreSQL database "
+                             f"(FIHRIS_DATABASE_URL), not {db.dialect.name}")
+        self.db, self.text, self.collection = db, text, collection
+        with db.begin() as conn:
+            conn.exec_driver_sql("CREATE EXTENSION IF NOT EXISTS vector")
+            conn.exec_driver_sql("CREATE SCHEMA IF NOT EXISTS fihris")
+            conn.exec_driver_sql("CREATE TABLE IF NOT EXISTS fihris.vector_alias "
+                                 "(name text PRIMARY KEY, collection text NOT NULL)")
+
+    @staticmethod
+    def _table(collection: str) -> str:
+        if not _TABLE_NAME.match(collection):
+            raise ValueError(f"not a collection name: {collection!r}")
+        return f"fihris.{collection}"
+
+    def _resolve(self, conn, collection: str | None) -> str | None:
+        name = collection or self.collection
+        if name != LIVE_ALIAS:
+            return name
+        return conn.execute(self.text("SELECT collection FROM fihris.vector_alias "
+                                      "WHERE name = :n"), {"n": LIVE_ALIAS}).scalar()
+
+    def _exists(self, conn, collection: str) -> bool:
+        return conn.execute(self.text("SELECT to_regclass(:t) IS NOT NULL"),
+                            {"t": self._table(collection)}).scalar()
+
+    def create(self, collection: str, points: Sequence[Point]) -> None:
+        table = self._table(collection)
+        with self.db.begin() as conn:
+            if self._exists(conn, collection):
+                raise ValueError(f"collection {collection} already exists")
+            conn.exec_driver_sql(
+                f"CREATE TABLE {table} (doc_id varchar(40) NOT NULL, page integer NOT NULL, "
+                "chunk integer NOT NULL, lang varchar(2) NOT NULL, groups text[] NOT NULL, "
+                f"searchable boolean NOT NULL, embedding vector({PINNED.vector_dim}) NOT NULL, "
+                "PRIMARY KEY (doc_id, page, chunk))")
+        self.upsert(collection, points)
+
+    def upsert(self, collection: str, points: Sequence[Point]) -> None:
+        sql = self.text(
+            f"INSERT INTO {self._table(collection)} AS t "
+            "(doc_id, page, chunk, lang, groups, searchable, embedding) "
+            "VALUES (:doc_id, :page, :chunk, :lang, CAST(:groups AS text[]), :searchable, "
+            "CAST(:embedding AS vector)) ON CONFLICT (doc_id, page, chunk) DO UPDATE SET "
+            "lang = EXCLUDED.lang, groups = EXCLUDED.groups, searchable = EXCLUDED.searchable, "
+            "embedding = EXCLUDED.embedding")
+        for start in range(0, len(points), BATCH):
+            rows = [{"doc_id": p.doc_id, "page": p.page, "chunk": p.chunk, "lang": p.lang,
+                     "groups": list(p.groups), "searchable": p.searchable,
+                     "embedding": _literal(p.vector)} for p in points[start:start + BATCH]]
+            with self.db.begin() as conn:
+                conn.execute(sql, rows)
+
+    def delete_document(self, collection: str, doc_id: str) -> None:
+        with self.db.begin() as conn:
+            conn.execute(self.text(f"DELETE FROM {self._table(collection)} WHERE doc_id = :d"),
+                         {"d": doc_id})
+
+    def set_access(self, collection: str, doc_id: str, groups: Iterable[str],
+                   searchable: bool) -> None:
+        with self.db.begin() as conn:
+            conn.execute(self.text(f"UPDATE {self._table(collection)} SET "
+                                   "groups = CAST(:g AS text[]), searchable = :s "
+                                   "WHERE doc_id = :d"),
+                         {"g": list(groups), "s": searchable, "d": doc_id})
+
+    def activate(self, collection: str) -> None:
+        """Point the live alias at ``collection``, in one statement."""
+        self._table(collection)
+        with self.db.begin() as conn:
+            conn.execute(self.text("INSERT INTO fihris.vector_alias (name, collection) "
+                                   "VALUES (:n, :c) ON CONFLICT (name) DO UPDATE SET "
+                                   "collection = EXCLUDED.collection"),
+                         {"n": LIVE_ALIAS, "c": collection})
+
+    def drop(self, collection: str) -> None:
+        with self.db.begin() as conn:
+            conn.exec_driver_sql(f"DROP TABLE IF EXISTS {self._table(collection)}")
+
+    def vectors(self, collection: str, keys: Sequence[Key]) -> dict[Key, np.ndarray]:
+        """Stored vectors of the given chunks, for reuse when their text is unchanged."""
+        wanted = set(keys)
+        out: dict[Key, np.ndarray] = {}
+        docs = sorted({k[0] for k in wanted})
+        sql = self.text(f"SELECT doc_id, page, chunk, CAST(embedding AS text) "
+                        f"FROM {self._table(collection)} "
+                        "WHERE doc_id = ANY(CAST(:docs AS text[]))")
+        with self.db.connect() as conn:
+            for start in range(0, len(docs), BATCH):
+                for doc_id, page, chunk, embedding in conn.execute(
+                        sql, {"docs": docs[start:start + BATCH]}):
+                    if (doc_id, page, chunk) in wanted:
+                        out[(doc_id, page, chunk)] = _parse(embedding)
+        return out
+
+    def count(self, collection: str | None = None) -> int:
+        with self.db.connect() as conn:
+            name = self._resolve(conn, collection)
+            if name is None or not self._exists(conn, name):
+                return 0
+            return conn.execute(self.text(f"SELECT count(*) FROM {self._table(name)}")).scalar()
+
+    def search(self, vectors: np.ndarray, principal: Principal,
+               k: int = PINNED.dense_depth) -> list[list[tuple[Key, float]]]:
+        vectors = np.asarray(vectors, dtype=np.float32)
+        with self.db.connect() as conn:
+            name = self._resolve(conn, None)
+        if name is None:
+            return [[] for _ in vectors]
+        where = "searchable"
+        params: dict = {"k": k}
+        if principal.allowed is not None:
+            where += " AND groups && CAST(:groups AS text[])"
+            params["groups"] = sorted(principal.allowed)
+        sql = self.text(
+            "SELECT doc_id, page, chunk, -(embedding <#> CAST(:q AS vector)) AS score "
+            f"FROM {self._table(name)} WHERE {where} "
+            "ORDER BY embedding <#> CAST(:q AS vector), doc_id, page, chunk LIMIT :k")
+
+        def one(vector: np.ndarray) -> list[tuple[Key, float]]:
+            with self.db.connect() as conn:
+                return [((d, int(p), int(c)), float(s))
+                        for d, p, c, s in conn.execute(sql, {**params, "q": _literal(vector)})]
+
+        if len(vectors) < 2:
+            return [one(v) for v in vectors]
+        with ThreadPoolExecutor(len(vectors)) as pool:
+            return list(pool.map(one, vectors))
+
+    def healthy(self) -> bool:
+        try:
+            with self.db.connect() as conn:
+                conn.exec_driver_sql("SELECT 1")
+            return True
+        except Exception:  # noqa: BLE001 - any failure means down
+            return False
+
+    def close(self) -> None:
+        pass
 
 
 class MemoryIndex:
