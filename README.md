@@ -135,7 +135,7 @@ The models come ready-made from the Hugging Face Hub, pinned to the revisions te
 | `tc-big` | `ooeoeo/opus-mt-tc-big-en-ar-ct2-float16` | `ai-path/opus-mt-tc-big-ar-en-ct2`, with the tokenizer files of `Helsinki-NLP/opus-mt-tc-big-ar-en` | 927 MiB | 57.8 / 65.3 |
 
 - **`opus-mt`** holds the same models as earlier versions of fihris (`Helsinki-NLP/opus-mt-en-ar` and `-ar-en`), converted to float16. On 100 test questions it gave the same translation as a float32 conversion for 98, and the same FLORES scores.
-- **`tc-big`** holds the larger Tatoeba-Challenge models. They score about 6 chrF++ higher in each direction, and take about 2.5 times the CPU time (a median of 0.74 s per question on 4 laptop threads, against 0.36 s). Whether they also retrieve better is being evaluated, so `opus-mt` stays the default.
+- **`tc-big`** holds the larger Tatoeba-Challenge models. They score about 6 chrF++ higher in each direction, and take about twice the CPU time (a median of 0.74 s per question on 4 laptop threads, against 0.36 s). Whether they also retrieve better is being evaluated, so `opus-mt` stays the default.
 
 Other ways to run the translator:
 
