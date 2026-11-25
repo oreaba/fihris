@@ -63,8 +63,8 @@ def same_ranking(reference: Sequence[tuple[Key, float]], candidate: Sequence[tup
 
 
 def open_index(endpoints: Endpoints, db, store: str | None = None, collection: str = LIVE_ALIAS):
-    """The vector store ``FIHRIS_VECTOR_STORE`` names: ``qdrant`` (the default) or ``pgvector``,
-    which keeps the vectors in the database ``db`` that holds everything else."""
+    """The vector store ``FIHRIS_VECTOR_STORE`` names: ``pgvector`` (the default), which keeps
+    the vectors in the database ``db`` that holds everything else, or ``qdrant``."""
     store = store or endpoints.vector_store
     if store == "qdrant":
         return QdrantIndex(endpoints, collection)
@@ -75,7 +75,11 @@ def open_index(endpoints: Endpoints, db, store: str | None = None, collection: s
 
 class QdrantIndex:
     def __init__(self, endpoints: Endpoints, collection: str = LIVE_ALIAS):
-        from qdrant_client import QdrantClient, models
+        try:
+            from qdrant_client import QdrantClient, models
+        except ImportError as error:
+            raise ImportError('the Qdrant store needs the qdrant extra: '
+                              'pip install "fihris[qdrant]"') from error
 
         self.models = models
         self.collection = collection

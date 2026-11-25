@@ -64,8 +64,8 @@ class Endpoints:
     qdrant_host: str = "127.0.0.1"
     qdrant_port: int = 6333
     qdrant_grpc_port: int = 6334
-    database_url: str = "sqlite:///artifacts/fihris/fihris.db"
-    vector_store: str = "qdrant"
+    database_url: str = "postgresql+psycopg://fihris@127.0.0.1:5432/fihris"
+    vector_store: str = "pgvector"
     corpus_root: Path = Path("documents")
     work_dir: Path = Path("artifacts/fihris")
     fonts_dir: Path = Path("fonts")

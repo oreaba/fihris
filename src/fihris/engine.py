@@ -1,7 +1,7 @@
 """The engine: the live index build in memory, retrieval, document changes and their jobs.
 
 One ``Engine`` per process. It holds the active build's chunk set (texts, languages, BM25 and
-the access mask) and a client for its Qdrant collection, behind the live alias. Document
+the access mask) and a client for its vector collection, behind the live alias. Document
 changes run as jobs on one worker thread, so the live build changes one document at a time.
 A corpus re-index builds a new collection and switches the alias only when it is complete.
 """

@@ -38,9 +38,15 @@ def _print(data: dict) -> None:
 
 
 def cmd_init_db(args) -> int:
-    db = engine_for(args.database or Endpoints.from_env().database_url)
+    from fihris.vectors import open_index
+
+    endpoints = Endpoints.from_env()
+    db = engine_for(args.database or endpoints.database_url)
     create_schema(db)
-    _print({"database": db.url.render_as_string(hide_password=True), "created": True})
+    if endpoints.vector_store == "pgvector":
+        open_index(endpoints, db)
+    _print({"database": db.url.render_as_string(hide_password=True),
+            "vector_store": endpoints.vector_store, "created": True})
     return 0
 
 

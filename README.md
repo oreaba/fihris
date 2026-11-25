@@ -24,7 +24,7 @@ It stops there: generating the answer from the sources is the caller's job.
 3. **ocr:** PDF pages in review are OCRed, and the OCR text replaces them when it passes its own check. Accepted pages with images and fewer than 50 words get the OCR lines they lack appended. Pages still in review go to the extraction review queue.
 4. **chunk:** structure-aware chunks, never crossing a page, each under a `Document:` and `Section:` header.
 5. **embed:** each chunk through the embedding server (Qwen3-Embedding 4B).
-6. **index:** the chunks into the database, where keyword search reads them, and their vectors into the vector store (Qdrant, or pgvector: see [Vector store](#vector-store)), in the live build.
+6. **index:** the chunks into the database, where keyword search reads them, and their vectors into the vector store (pgvector in the same database, or Qdrant: see [Vector store](#vector-store)), in the live build.
 
 Other jobs reuse these steps: `replace` (a new version of a file: all six), `remove`, `reindex_document` and `rechunk_page` (chunk, embed, index) and `reindex_corpus` (chunk, embed and index into a new build, then switch the live alias). `fihris import-pages` (see [Use](#use)) loads page text extracted elsewhere and skips extraction.
 
@@ -45,10 +45,10 @@ These settings are pinned in [`config.py`](https://github.com/oreaba/fihris/blob
 |---|---|---|
 | Embedding server (OpenAI-compatible `/v1/embeddings`, such as vLLM serving `Qwen/Qwen3-Embedding-4B`) | `http://127.0.0.1:8100` | `FIHRIS_EMBED_URL` |
 | Reranker server (vLLM `/classify` serving `BAAI/bge-reranker-v2-m3`) | `http://127.0.0.1:8101` | `FIHRIS_RERANK_URL` |
-| Vector store: `qdrant` or `pgvector` (see [Vector store](#vector-store)) | `qdrant` | `FIHRIS_VECTOR_STORE` |
-| Qdrant, when it is the vector store | `127.0.0.1:6333` (gRPC 6334) | `FIHRIS_QDRANT_HOST`, `FIHRIS_QDRANT_PORT`, `FIHRIS_QDRANT_GRPC_PORT` |
-| Database (SQLAlchemy URL; SQLite or PostgreSQL, which pgvector needs) | `sqlite:///artifacts/fihris/fihris.db` | `FIHRIS_DATABASE_URL` |
-| Translator models (`Helsinki-NLP/opus-mt-en-ar`, `opus-mt-ar-en`) in the Hugging Face cache | GPU when available | `FIHRIS_TRANSLATOR_DEVICE` |
+| PostgreSQL with the pgvector extension: documents, pages, chunks, builds, jobs and the vectors | `postgresql+psycopg://fihris@127.0.0.1:5432/fihris` | `FIHRIS_DATABASE_URL` |
+| Vector store: `pgvector`, or `qdrant` (see [Vector store](#vector-store)) | `pgvector` | `FIHRIS_VECTOR_STORE` |
+| Qdrant, only when it is the vector store | `127.0.0.1:6333` (gRPC 6334) | `FIHRIS_QDRANT_HOST`, `FIHRIS_QDRANT_PORT`, `FIHRIS_QDRANT_GRPC_PORT` |
+| Translator models (`Helsinki-NLP/opus-mt-en-ar`, `opus-mt-ar-en`) in the Hugging Face cache | `cuda` (`cpu` on a machine without an NVIDIA GPU) | `FIHRIS_TRANSLATOR_DEVICE` |
 | Fonts folder for Arabic PDFs (see [pdf-ar](https://github.com/oreaba/pdf-ar#fonts)) | `fonts` | `FIHRIS_FONTS_DIR` |
 | Documents folder for `import-pages` | `documents` | `FIHRIS_CORPUS_ROOT` |
 | Work folder for uploads and temporary files | `artifacts/fihris` | `FIHRIS_WORK_DIR` |
@@ -60,11 +60,22 @@ Model files are read from the local Hugging Face cache only (`local_files_only`)
 Python 3.11 or later:
 
 ```
-pip install "fihris[translate]"                  # with SQLite
-pip install "fihris[postgres,translate,ocr]"     # PostgreSQL (and pgvector) and the OCR fallback too
+pip install "fihris[translate]"                  # PostgreSQL and pgvector
+pip install "fihris[translate,ocr]"              # with the OCR fallback too
+pip install "fihris[translate,qdrant]"           # Qdrant as the vector store instead
 ```
 
 Or from a clone of the [repository](https://github.com/oreaba/fihris): `pip install -e ".[translate,ocr,dev]"`.
+
+PostgreSQL itself runs outside pip, with the pgvector extension available, for example:
+
+```
+docker run -d --name fihris-postgres -p 127.0.0.1:5432:5432 -e POSTGRES_USER=fihris \
+  -e POSTGRES_PASSWORD=change-me -v fihris-pg:/var/lib/postgresql pgvector/pgvector:pg18
+export FIHRIS_DATABASE_URL=postgresql+psycopg://fihris:change-me@127.0.0.1:5432/fihris
+```
+
+`fihris init-db` then creates the `fihris` schema, its tables and the `vector` extension (its database role must be allowed to create it).
 
 Search translates every question, so it needs the `translate` extra (torch). Without it, ingestion, the library and builds still work. Install the torch build that matches your hardware first if you want CUDA.
 
@@ -80,7 +91,7 @@ fihris access --doc doc_0123456789abcdef --groups hr
 fihris reindex                                    # re-chunk everything into a new build
 ```
 
-`fihris compare-stores questions.txt --copy` copies the live build's vectors from Qdrant into pgvector and checks that both return the same dense lists (see [Vector store](#vector-store)).
+`fihris compare-stores questions.txt --copy` copies the live build's vectors from Qdrant into pgvector and checks that both return the same dense lists (see [Vector store](#vector-store); needs the `qdrant` extra).
 
 `fihris import-pages --catalogue docs.jsonl --pages pages.jsonl --activate` loads documents extracted elsewhere: a catalogue with one document per line (any `Document` column, and at least `relative_path` or `doc_id`) and a page index (`doc_id`, `page`, `status`, `text` and optional `md` per line).
 
@@ -110,19 +121,12 @@ for source in result.sources:
 
 Both stores search exactly, comparing the question with every vector and using no approximate index, so they return the same lists. They differ in speed and in what you run:
 
-- **Qdrant (default):** its own container. On a DGX Spark at about 12,000 chunks, a search took 8.7 ms at the 95th percentile with 4 in flight.
-- **pgvector:** the vectors live in fihris's PostgreSQL database (schema `fihris`, one table per build, and the live alias in `fihris.vector_alias`), so there is one database to run and back up. The same measurement gave 80 ms, growing with the corpus (632 ms at ten times the chunks). A question's two searches run in parallel.
+- **pgvector (default):** the vectors live in fihris's PostgreSQL database (schema `fihris`, one table per build, and the live alias in `fihris.vector_alias`), so there is one database to run and back up. On a DGX Spark at about 12,000 chunks, a search took 80 ms at the 95th percentile with 4 in flight, growing with the corpus (632 ms at ten times the chunks). A question's two searches run in parallel.
+- **Qdrant:** its own container, with `pip install "fihris[qdrant]"` and `FIHRIS_VECTOR_STORE=qdrant`. The same measurement gave 8.7 ms (56 ms at ten times the chunks).
 
-To use pgvector, run PostgreSQL with the pgvector extension (for example the `pgvector/pgvector:pg18` image) and set:
+With Qdrant, the database may also be SQLite (`FIHRIS_DATABASE_URL=sqlite:///artifacts/fihris/fihris.db`), for a laptop or a test; pgvector needs PostgreSQL.
 
-```
-FIHRIS_DATABASE_URL=postgresql+psycopg://fihris:password@127.0.0.1:5432/fihris
-FIHRIS_VECTOR_STORE=pgvector
-```
-
-Fihris creates the extension (its database role must be allowed to), the tables and the alias.
-
-To move a Qdrant build without re-embedding, keep Qdrant reachable and run `fihris compare-stores questions.txt --copy`. It copies the live build's vectors unchanged, then searches every question and its translation in both stores and compares their top 100: chunks whose scores tie within 1e-5 may swap, and anything else counts as different (exit code 1). It also reports each store's search time. `--groups` searches as a principal with those groups, and `--pgvector-url` points the pgvector side at a PostgreSQL database other than fihris's own.
+To move a Qdrant build to pgvector without re-embedding, keep Qdrant reachable and run `fihris compare-stores questions.txt --copy`. It copies the live build's vectors unchanged, then searches every question and its translation in both stores and compares their top 100: chunks whose scores tie within 1e-5 may swap, and anything else counts as different (exit code 1). It also reports each store's search time. `--groups` searches as a principal with those groups, and `--pgvector-url` points the pgvector side at a PostgreSQL database other than fihris's own.
 
 ## Access model
 
@@ -138,9 +142,9 @@ pip install -e ".[dev]"
 pytest
 ```
 
-Model servers are replaced by deterministic fakes, and the vector store by `MemoryIndex`, the same contract in NumPy.
+Model servers are replaced by deterministic fakes, the database by SQLite and the vector store by `MemoryIndex`, the same contract in NumPy.
 
-With `FIHRIS_TEST_PG_URL` set to a PostgreSQL database with pgvector that the tests may wipe (they drop its `fihris` schema), the engine tests run again on PostgreSQL and pgvector, and pgvector is checked against `MemoryIndex` through updates and build switches. This needs the `postgres` extra:
+With `FIHRIS_TEST_PG_URL` set to a PostgreSQL database with pgvector that the tests may wipe (they drop its `fihris` schema), the engine tests run again on PostgreSQL and pgvector, and pgvector is checked against `MemoryIndex` through updates and build switches:
 
 ```
 docker run -d -p 127.0.0.1:55432:5432 -e POSTGRES_USER=fihris -e POSTGRES_PASSWORD=fihris pgvector/pgvector:pg18

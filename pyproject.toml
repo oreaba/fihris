@@ -10,7 +10,8 @@ readme = "README.md"
 license = "AGPL-3.0-only"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
-keywords = ["rag", "retrieval", "arabic", "search", "bm25", "embeddings", "reranking", "qdrant"]
+keywords = ["rag", "retrieval", "arabic", "search", "bm25", "embeddings", "reranking",
+            "postgresql", "pgvector", "qdrant"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -28,7 +29,7 @@ dependencies = [
     "textkeel>=0.3",
     "numpy>=1.26",
     "sqlalchemy>=2.0.36",
-    "qdrant-client>=1.12",
+    "psycopg[binary]>=3.2",
     "transformers>=4.46",
     "sentencepiece>=0.2",
     "huggingface-hub>=0.26",
@@ -36,9 +37,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# PostgreSQL instead of SQLite, and the pgvector store (FIHRIS_VECTOR_STORE=pgvector).
-postgres = [
-    "psycopg[binary]>=3.2",
+# Qdrant as the vector store (FIHRIS_VECTOR_STORE=qdrant) instead of pgvector, and compare-stores.
+qdrant = [
+    "qdrant-client>=1.12",
 ]
 # The opus-mt question translator runs locally on torch (CUDA when available).
 translate = [
