@@ -6,7 +6,7 @@ They are only clients: nothing here starts, stops or reconfigures a server.
 - reranking: token IDs from the reranker's own tokenizer, sent to ``/classify``, scored by the
   first class probability;
 - translation: opus-mt with beam search over one question at a time, either through CTranslate2
-  (``CT2Translator``, the default: models converted once, no torch, on the CPU) or through
+  (``CT2Translator``, the default: ready-made models, no torch, on the CPU) or through
   transformers and torch (``OpusTranslator``, on the GPU by default).
 """
 
@@ -21,7 +21,7 @@ from typing import Protocol
 
 import numpy as np
 
-from fihris.config import PINNED, Endpoints
+from fihris.config import PINNED, TOKENIZER_PATTERNS, TRANSLATOR_SETS, Endpoints
 
 
 class Embedder(Protocol):
@@ -43,11 +43,14 @@ def _post(url: str, body: dict, timeout: float) -> dict:
         return json.loads(response.read())
 
 
-def snapshot(repo: str) -> Path:
-    """A model already in the local Hugging Face cache. Never downloads (air-gapped)."""
+def snapshot(repo: str, revision: str | None = None,
+             allow_patterns: list[str] | None = None) -> Path:
+    """A model already in the local Hugging Face cache. Never downloads (air-gapped). A repo
+    fetched in part is found only with the patterns it was fetched with."""
     from huggingface_hub import snapshot_download
 
-    return Path(snapshot_download(repo, local_files_only=True))
+    return Path(snapshot_download(repo, revision=revision, allow_patterns=allow_patterns,
+                                  local_files_only=True))
 
 
 class EmbeddingClient:
@@ -146,31 +149,82 @@ TOKENIZER_FILES = ("vocab.json", "source.spm", "target.spm", "tokenizer_config.j
 
 def converted_path(endpoints: Endpoints, repo: str) -> Path:
     """Where ``fihris convert-translators`` puts ``repo`` in CTranslate2's format."""
-    return endpoints.translator_dir / repo.split("/")[-1]
+    return (endpoints.translator_dir or Path("translators")) / repo.split("/")[-1]
+
+
+def translator_set(name: str) -> dict:
+    if name not in TRANSLATOR_SETS:
+        raise ValueError(f"FIHRIS_TRANSLATOR_MODELS must be one of {sorted(TRANSLATOR_SETS)}, "
+                         f"not {name!r}")
+    return TRANSLATOR_SETS[name]
+
+
+def _cached(repo: str, revision: str, allow_patterns: list[str] | None = None) -> Path:
+    try:
+        return snapshot(repo, revision, allow_patterns)
+    except Exception as error:  # noqa: BLE001 - any miss means it was never downloaded
+        raise FileNotFoundError(f"{repo} at {revision[:12]} is not in the Hugging Face cache: "
+                                "run `fihris download-translators`") from error
+
+
+def translator_dirs(endpoints: Endpoints) -> dict[str, tuple[Path, Path, str, str]]:
+    """Per source language: the model folder, the tokenizer folder, the target-language token and
+    the model's name. Converted copies in ``FIHRIS_TRANSLATOR_DIR`` when it is set; otherwise
+    the ready-made set ``FIHRIS_TRANSLATOR_MODELS`` from the Hugging Face cache."""
+    out = {}
+    if endpoints.translator_dir:
+        for lang, (repo, token) in PINNED.translators.items():
+            path = converted_path(endpoints, repo)
+            if not (path / "model.bin").is_file():
+                raise FileNotFoundError(
+                    f"no CTranslate2 copy of {repo} in {path}: run `fihris convert-translators` "
+                    "once where torch is installed, or unset FIHRIS_TRANSLATOR_DIR to use the "
+                    "ready-made models")
+            out[lang] = (path, path, token, repo)
+        return out
+    for lang, spec in translator_set(endpoints.translator_models).items():
+        model = _cached(spec["model"], spec["revision"])
+        tokenizer = (_cached(spec["tokenizer"], spec["tokenizer_revision"], TOKENIZER_PATTERNS)
+                     if "tokenizer" in spec else model)
+        out[lang] = (model, tokenizer, spec["token"], spec["model"])
+    return out
+
+
+def download_translators(name: str) -> list[dict]:
+    """The ready-made set ``name`` into the Hugging Face cache, at its pinned revisions. The only
+    step that uses the network; translating never does."""
+    from huggingface_hub import snapshot_download
+
+    report = []
+    for spec in translator_set(name).values():
+        for repo, revision, patterns in (
+                (spec["model"], spec["revision"], None),
+                (spec.get("tokenizer"), spec.get("tokenizer_revision"), TOKENIZER_PATTERNS)):
+            if repo:
+                path = Path(snapshot_download(repo, revision=revision, allow_patterns=patterns))
+                report.append({"repo": repo, "revision": revision, "path": str(path),
+                               "mib": round(sum(f.stat().st_size for f in path.rglob("*")
+                                                if f.is_file()) / 2**20)})
+    return report
 
 
 class CT2Translator:
-    """Both opus-mt models in CTranslate2's format (``fihris convert-translators``), float32, with
-    the same beam search as ``OpusTranslator`` and no torch. CPU by default: the ARM64 wheels on
-    PyPI have no GPU support. One lock per model, as in ``OpusTranslator``."""
+    """Both directions in CTranslate2's format, float32 compute, with the same beam search as
+    ``OpusTranslator`` and no torch: a ready-made set from the Hugging Face cache, or copies
+    converted by ``fihris convert-translators``. CPU by default: the ARM64 wheels on PyPI have no
+    GPU support. One lock per model, as in ``OpusTranslator``."""
 
-    def __init__(self, endpoints: Endpoints, paths: dict[str, Path] | None = None):
+    def __init__(self, endpoints: Endpoints):
         import ctranslate2
         from transformers import MarianTokenizer
 
         self.device = endpoints.translator_device or "cpu"
         self.models = {}
-        for lang, (repo, token) in PINNED.translators.items():
-            path = (paths or {}).get(lang) or converted_path(endpoints, repo)
-            if not (path / "model.bin").is_file():
-                raise FileNotFoundError(
-                    f"no CTranslate2 copy of {repo} in {path}: run `fihris convert-translators` "
-                    "once where torch is installed, or copy its output folder here "
-                    "(FIHRIS_TRANSLATOR_DIR)")
-            tokenizer = MarianTokenizer.from_pretrained(path)
+        for lang, (model, tokenizer_dir, token, name) in translator_dirs(endpoints).items():
+            tokenizer = MarianTokenizer.from_pretrained(tokenizer_dir)
             if token and token not in tokenizer.supported_language_codes:
-                raise ValueError(f"{token} is not a target language of {repo}")
-            translator = ctranslate2.Translator(str(path), device=self.device,
+                raise ValueError(f"{token} is not a target language of {name}")
+            translator = ctranslate2.Translator(str(model), device=self.device,
                                                 compute_type="float32")
             self.models[lang] = (tokenizer, translator, token, threading.Lock())
 
@@ -190,7 +244,8 @@ class CT2Translator:
 def convert_translators(endpoints: Endpoints, out: Path | None = None,
                         force: bool = False) -> list[dict]:
     """Both opus-mt models from the local Hugging Face cache into CTranslate2's format, float32,
-    with their tokenizer files. Needs torch, once: ctranslate2's converter loads the model."""
+    with their tokenizer files, for ``FIHRIS_TRANSLATOR_DIR``. Needs torch, once: ctranslate2's
+    converter loads the model. The ready-made sets need none of this."""
     import ctranslate2
 
     report = []

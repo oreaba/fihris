@@ -30,7 +30,7 @@ Other jobs reuse these steps: `replace` (a new version of a file: all six), `rem
 
 ## Retrieval
 
-1. Translate the question into the other language (opus-mt through CTranslate2, local; see [Translator](#translator)).
+1. Translate the question into the other language (opus-mt through CTranslate2, on the CPU; see [Translator](#translator)).
 2. BM25 on the question and on its translation, top 100 each, over the allowed chunks.
 3. Dense search with Qwen3-Embedding 4B (with its query instruction) on both, top 100 each, filtered in the vector store.
 4. Reciprocal rank fusion of the four lists (k 60, depth 100).
@@ -49,7 +49,8 @@ These settings are pinned in [`config.py`](https://github.com/oreaba/fihris/blob
 | Vector store: `pgvector`, or `qdrant` (see [Vector store](#vector-store)) | `pgvector` | `FIHRIS_VECTOR_STORE` |
 | Qdrant, only when it is the vector store | `127.0.0.1:6333` (gRPC 6334) | `FIHRIS_QDRANT_HOST`, `FIHRIS_QDRANT_PORT`, `FIHRIS_QDRANT_GRPC_PORT` |
 | Translator: `ct2`, or `torch` (see [Translator](#translator)) | `ct2` | `FIHRIS_TRANSLATOR` |
-| Translator models (`Helsinki-NLP/opus-mt-en-ar`, `opus-mt-ar-en`) converted by `fihris convert-translators` | `translators` | `FIHRIS_TRANSLATOR_DIR` |
+| Translator models: a ready-made set in the Hugging Face cache (`fihris download-translators`) | `opus-mt` | `FIHRIS_TRANSLATOR_MODELS` |
+| Or your own converted copies (`fihris convert-translators`) | unset | `FIHRIS_TRANSLATOR_DIR` |
 | Translator device | `cpu` for `ct2`, `cuda` for `torch` | `FIHRIS_TRANSLATOR_DEVICE` |
 | Reranker tokenizer (`BAAI/bge-reranker-v2-m3`) in the Hugging Face cache: fihris tokenizes the pairs it sends | | `HF_HOME` |
 | Fonts folder for Arabic PDFs (see [pdf-ar](https://github.com/oreaba/pdf-ar#fonts)) | `fonts` | `FIHRIS_FONTS_DIR` |
@@ -66,7 +67,7 @@ Python 3.11 or later:
 pip install fihris                  # PostgreSQL, pgvector and the CTranslate2 translator
 pip install "fihris[ocr]"           # with the OCR fallback too
 pip install "fihris[qdrant]"        # Qdrant as the vector store instead
-pip install "fihris[torch]"         # the torch translator, and converting the translator models
+pip install "fihris[torch]"         # the torch translator, or your own translator conversion
 ```
 
 Or from a clone of the [repository](https://github.com/oreaba/fihris): `pip install -e ".[ocr,dev]"`.
@@ -81,12 +82,12 @@ export FIHRIS_DATABASE_URL=postgresql+psycopg://fihris:change-me@127.0.0.1:5432/
 
 `fihris init-db` then creates the `fihris` schema, its tables and the `vector` extension (its database role must be allowed to create it).
 
-Search translates every question, with the opus-mt models converted for CTranslate2: run `fihris convert-translators` once where torch is installed, then copy the `translators` folder anywhere else (see [Translator](#translator)).
+Search translates every question: run `fihris download-translators` once to fetch the ready-made translator models (see [Translator](#translator)).
 
 ## Use
 
 ```
-fihris convert-translators                        # once, where torch is installed
+fihris download-translators                       # once: the translator models
 fihris init-db
 fihris ingest documents/ --visible-to-all          # files or folders, one job per file
 fihris search "How many days of annual leave do staff get?" --text
@@ -124,24 +125,26 @@ for source in result.sources:
 
 ## Translator
 
-The question is translated by the opus-mt models (`Helsinki-NLP/opus-mt-en-ar` and `opus-mt-ar-en`), beam search of 4, one question at a time. Two engines run them:
+The question is translated into the other language with beam search of 4, one question at a time, by CTranslate2 (`FIHRIS_TRANSLATOR=ct2`, the default) on the CPU. No torch: the `ctranslate2` package is 2 MiB on ARM64 Linux and about 25 MiB on x86-64, against about 500 MiB for torch alone. The ARM64 wheels on PyPI have no GPU support.
 
-- **CTranslate2 (default, `FIHRIS_TRANSLATOR=ct2`):** the models converted once into CTranslate2's format, in float32. No torch: the `ctranslate2` package is 2 MiB on ARM64 Linux and about 25 MiB on x86-64, against about 500 MiB for torch alone. CPU by default; the ARM64 wheels on PyPI have no GPU support.
-- **torch (`FIHRIS_TRANSLATOR=torch`, `pip install "fihris[torch]"`):** transformers on torch, on the GPU by default, as earlier versions of fihris ran.
+The models come ready-made from the Hugging Face Hub, pinned to the revisions tested; nothing is converted. `fihris download-translators` fetches the set `FIHRIS_TRANSLATOR_MODELS` names into the Hugging Face cache, and is the only step that uses the network:
 
-On the 100 questions of a golden set, 50 English and 50 Arabic, CTranslate2 gave the same translation as torch for 93; the other 7 differed by 1 to 6 words. On the same 4 CPU threads, a question took 294 ms at the median with CTranslate2 and 513 ms with torch.
+| Set | English to Arabic | Arabic to English | Size | FLORES-200 devtest chrF++, en→ar / ar→en |
+|---|---|---|---|---|
+| `opus-mt` (default) | `ooeoeo/opus-mt-en-ar-ct2-float16` | `ooeoeo/opus-mt-ar-en-ct2-float16` | 303 MiB | 51.5 / 59.1 |
+| `tc-big` | `ooeoeo/opus-mt-tc-big-en-ar-ct2-float16` | `ai-path/opus-mt-tc-big-ar-en-ct2`, with the tokenizer files of `Helsinki-NLP/opus-mt-tc-big-ar-en` | 927 MiB | 57.8 / 65.3 |
 
-Converting needs torch once (`fihris[torch]`, or any environment that has it, such as a vLLM container). It reads the models from the Hugging Face cache and writes them, with their tokenizer files, to `FIHRIS_TRANSLATOR_DIR`:
+- **`opus-mt`** holds the same models as earlier versions of fihris (`Helsinki-NLP/opus-mt-en-ar` and `-ar-en`), converted to float16. On 100 test questions it gave the same translation as a float32 conversion for 98, and the same FLORES scores.
+- **`tc-big`** holds the larger Tatoeba-Challenge models. They score about 6 chrF++ higher in each direction, and take about 2.5 times the CPU time (a median of 0.74 s per question on 4 laptop threads, against 0.36 s). Whether they also retrieve better is being evaluated, so `opus-mt` stays the default.
 
-```
-huggingface-cli download Helsinki-NLP/opus-mt-en-ar
-huggingface-cli download Helsinki-NLP/opus-mt-ar-en
-fihris convert-translators
-```
+Other ways to run the translator:
 
-The `translators` folder (about 600 MB) can then be copied to any machine, which needs neither torch nor the original models. transformers notes on start that PyTorch was not found: fihris only uses its tokenizers.
+- **Your own conversion:** `fihris convert-translators` converts `Helsinki-NLP/opus-mt-en-ar` and `-ar-en` from the Hugging Face cache into CTranslate2's format in float32. It needs torch once (`fihris[torch]`, or an environment that has it, such as a vLLM container). Set `FIHRIS_TRANSLATOR_DIR` to its output folder to use it.
+- **torch:** `FIHRIS_TRANSLATOR=torch` with `pip install "fihris[torch]"` runs `Helsinki-NLP/opus-mt-en-ar` and `-ar-en` through transformers, on the GPU by default, as fihris 0.3 and earlier did. On 100 test questions, a float32 CTranslate2 conversion gave the same translation as torch for 93; the other 7 differed by 1 to 6 words.
 
-`fihris compare-translators questions.txt` runs both engines on the same questions and reports how many translations are identical. For those that differ, it runs retrieval with each and reports whether the sources change. It needs torch, and the whole pipeline unless `--translations-only`.
+`fihris compare-translators questions.txt --a opus-mt --b tc-big` runs two translators on the same questions and reports how many translations are identical. For those that differ, it runs retrieval with each and reports whether the sources change. Each side is `torch`, `converted` or a set's name; it needs the whole pipeline unless `--translations-only`.
+
+transformers notes on start that PyTorch was not found: fihris only uses its tokenizers.
 
 ## Vector store
 
@@ -179,4 +182,4 @@ FIHRIS_TEST_PG_URL=postgresql+psycopg://fihris:fihris@127.0.0.1:55432/fihris pyt
 
 ## License
 
-[AGPL-3.0](https://github.com/oreaba/fihris/blob/main/LICENSE). Fihris requires textkeel, pdf-ar and PyMuPDF, which are AGPL-3.0 (PyMuPDF also sells a commercial license).
+[AGPL-3.0](https://github.com/oreaba/fihris/blob/main/LICENSE). Fihris requires textkeel, pdf-ar and PyMuPDF, which are AGPL-3.0 (PyMuPDF also sells a commercial license). The translator models are not part of the package: they are OPUS-MT models by the University of Helsinki, under CC BY 4.0, in conversions published by `ooeoeo` and `ai-path`.

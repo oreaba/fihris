@@ -14,6 +14,27 @@ QUERY_INSTRUCTION = ("Instruct: Given a web search query, retrieve relevant pass
                      "answer the query\nQuery:")
 EVERYONE = "all"
 
+# Ready-made CTranslate2 translators on the Hugging Face Hub, pinned to the revisions tested.
+# ``opus-mt``: the models Stage 6 measured, converted to float16. ``tc-big``: the larger
+# Tatoeba-Challenge models; ai-path's repo has no tokenizer files, so they come from upstream.
+TRANSLATOR_SETS = {
+    "opus-mt": {
+        "en": {"model": "ooeoeo/opus-mt-en-ar-ct2-float16",
+               "revision": "908c1eb592272e7e9144145e6785f9af4b70d2db", "token": ">>ara<<"},
+        "ar": {"model": "ooeoeo/opus-mt-ar-en-ct2-float16",
+               "revision": "4f50aae25375af44f24f87becac4349059d92486", "token": ""},
+    },
+    "tc-big": {
+        "en": {"model": "ooeoeo/opus-mt-tc-big-en-ar-ct2-float16",
+               "revision": "28f8107e24e43464db6509ed772a75c4a9c418ba", "token": ">>ara<<"},
+        "ar": {"model": "ai-path/opus-mt-tc-big-ar-en-ct2",
+               "revision": "787b4410734b7e9b21ef27b9011e37b09c0b00c6", "token": "",
+               "tokenizer": "Helsinki-NLP/opus-mt-tc-big-ar-en",
+               "tokenizer_revision": "bcb4acd39ee8e3552e171653a8e31a10729b4330"},
+    },
+}
+TOKENIZER_PATTERNS = ["*.spm", "vocab.json", "tokenizer_config.json", "special_tokens_map.json"]
+
 
 @dataclass(frozen=True)
 class Pinned:
@@ -71,7 +92,8 @@ class Endpoints:
     fonts_dir: Path = Path("fonts")
     tesseract_cmd: str | None = None
     translator: str = "ct2"
-    translator_dir: Path = Path("translators")
+    translator_models: str = "opus-mt"
+    translator_dir: Path | None = None
     translator_device: str = ""
     min_free_gpu_gib: float = 2.0
     timeout_s: float = 120.0
@@ -94,7 +116,9 @@ class Endpoints:
             fonts_dir=Path(env("FIHRIS_FONTS_DIR", str(base.fonts_dir))),
             tesseract_cmd=env("FIHRIS_TESSERACT_CMD") or None,
             translator=env("FIHRIS_TRANSLATOR", base.translator),
-            translator_dir=Path(env("FIHRIS_TRANSLATOR_DIR", str(base.translator_dir))),
+            translator_models=env("FIHRIS_TRANSLATOR_MODELS", base.translator_models),
+            translator_dir=Path(env("FIHRIS_TRANSLATOR_DIR")) if env("FIHRIS_TRANSLATOR_DIR")
+            else base.translator_dir,
             translator_device=env("FIHRIS_TRANSLATOR_DEVICE", base.translator_device),
             min_free_gpu_gib=float(env("FIHRIS_MIN_FREE_GPU_GIB", base.min_free_gpu_gib)),
             timeout_s=float(env("FIHRIS_TIMEOUT_S", base.timeout_s)))

@@ -292,26 +292,53 @@ def cmd_compare_stores(args) -> int:
     return 0 if verdicts["different"] == 0 else 1
 
 
+def cmd_download_translators(args) -> int:
+    """A ready-made translator set into the Hugging Face cache, at its pinned revisions."""
+    from fihris.clients import download_translators
+
+    name = args.models or Endpoints.from_env().translator_models
+    _print({"models": name, "downloaded": download_translators(name)})
+    return 0
+
+
 def cmd_convert_translators(args) -> int:
-    """Both opus-mt models from the Hugging Face cache into CTranslate2's format, for the default
-    translator. Needs torch, once."""
+    """Both opus-mt models from the Hugging Face cache into CTranslate2's format, for
+    ``FIHRIS_TRANSLATOR_DIR``. Needs torch, once."""
     from fihris.clients import convert_translators
 
     _print({"translators": convert_translators(Endpoints.from_env(), args.out, args.force)})
     return 0
 
 
-def cmd_compare_translators(args) -> int:
-    """The torch and CTranslate2 translators on the same questions: identical translations, and,
-    for those that differ, whether retrieval's sources change. Needs torch and, unless
-    ``--translations-only``, the whole pipeline."""
+def _translator(endpoints: Endpoints, name: str):
+    """``torch``, ``converted`` (FIHRIS_TRANSLATOR_DIR, default ``translators``) or the name of a
+    ready-made set."""
+    from dataclasses import replace
+
     from fihris.clients import CT2Translator, OpusTranslator
+
+    if name == "torch":
+        return OpusTranslator(endpoints)
+    if name == "converted":
+        folder = endpoints.translator_dir or Path("translators")
+        return CT2Translator(replace(endpoints, translator_dir=folder))
+    return CT2Translator(replace(endpoints, translator_models=name, translator_dir=None))
+
+
+def cmd_compare_translators(args) -> int:
+    """Two translators on the same questions: identical translations, and, for those that differ,
+    whether retrieval's sources change. Needs the whole pipeline unless ``--translations-only``,
+    and torch only when one side is ``torch``."""
     from fihris.retrieve import Retriever, detect_language
 
     endpoints = Endpoints.from_env()
     with args.questions.open(encoding="utf-8") as handle:
         questions = [line.strip() for line in handle if line.strip()]
-    translators = {"torch": OpusTranslator(endpoints), "ct2": CT2Translator(endpoints)}
+    a, b = args.a, args.b
+    if a == b:
+        print("--a and --b name the same translator", file=sys.stderr)
+        return 2
+    translators = {a: _translator(endpoints, a), b: _translator(endpoints, b)}
     times: dict[str, list[float]] = {name: [] for name in translators}
     differing = []
     for i, question in enumerate(questions):
@@ -321,7 +348,7 @@ def cmd_compare_translators(args) -> int:
             start = time.perf_counter()
             out[name] = translator.translate(question, lang)
             times[name].append(1000 * (time.perf_counter() - start))
-        if out["torch"] != out["ct2"]:
+        if out[a] != out[b]:
             differing.append(i)
     report: dict = {"questions": len(questions),
                     "translations_identical": len(questions) - len(differing),
@@ -341,9 +368,9 @@ def cmd_compare_translators(args) -> int:
                                       engine.scorer, translator)
                 result = retriever.retrieve(questions[i], Principal.unrestricted())
                 lists[name] = [(s.doc_id, s.page, s.chunk) for s in result.sources]
-            if lists["torch"] == lists["ct2"]:
+            if lists[a] == lists[b]:
                 sources["identical"] += 1
-            elif sorted(lists["torch"]) == sorted(lists["ct2"]):
+            elif sorted(lists[a]) == sorted(lists[b]):
                 sources["same_sources_other_order"] += 1
             else:
                 sources["different"] += 1
@@ -405,15 +432,25 @@ def parser() -> argparse.ArgumentParser:
     s.add_argument("--pgvector-url", help="PostgreSQL URL for the pgvector side (default: the "
                    "fihris database, which must then be PostgreSQL)")
     s.set_defaults(run=cmd_compare_stores)
+    from fihris.config import TRANSLATOR_SETS
+
+    s = sub.add_parser("download-translators", help="a ready-made translator set into the "
+                       "Hugging Face cache (the only step that uses the network)")
+    s.add_argument("--models", choices=sorted(TRANSLATOR_SETS),
+                   help="the set (default FIHRIS_TRANSLATOR_MODELS)")
+    s.set_defaults(run=cmd_download_translators)
     s = sub.add_parser("convert-translators", help="the opus-mt models into CTranslate2's "
-                       "format, for the default translator (needs torch, once)")
+                       "format, for FIHRIS_TRANSLATOR_DIR (needs torch, once)")
     s.add_argument("--out", type=Path, help="folder for the converted models (default "
                    "FIHRIS_TRANSLATOR_DIR)")
     s.add_argument("--force", action="store_true", help="convert again over an existing copy")
     s.set_defaults(run=cmd_convert_translators)
-    s = sub.add_parser("compare-translators", help="the torch and CTranslate2 translators on "
-                       "the same questions, and the sources retrieval returns with each")
+    s = sub.add_parser("compare-translators", help="two translators on the same questions, and "
+                       "the sources retrieval returns with each")
     s.add_argument("questions", type=Path, help="one question per line")
+    names = ["torch", "converted", *sorted(TRANSLATOR_SETS)]
+    s.add_argument("--a", choices=names, default="opus-mt", help="default opus-mt")
+    s.add_argument("--b", choices=names, default="tc-big", help="default tc-big")
     s.add_argument("--translations-only", action="store_true",
                    help="compare the translations only, without retrieval")
     s.set_defaults(run=cmd_compare_translators)

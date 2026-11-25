@@ -416,14 +416,26 @@ def test_same_ranking_allows_only_near_tie_swaps():
     assert not same_ranking(ref, [(k, 0) for k in "abc"], scores.get)
 
 
-def test_translator_is_ct2_by_default_and_names_a_missing_conversion(tmp_path):
-    from fihris.clients import CT2Translator, open_translator
+def test_translator_is_ct2_by_default_and_names_what_is_missing(tmp_path, monkeypatch):
+    from fihris import clients
+    from fihris.config import TRANSLATOR_SETS
 
-    assert Endpoints().translator == "ct2"
+    assert (Endpoints().translator, Endpoints().translator_models) == ("ct2", "opus-mt")
+    assert all(set(s) == {"en", "ar"} and s["en"]["token"] == ">>ara<<"
+               for s in TRANSLATOR_SETS.values())
     with pytest.raises(FileNotFoundError, match="convert-translators"):
-        CT2Translator(Endpoints(translator_dir=tmp_path / "none"))
+        clients.CT2Translator(Endpoints(translator_dir=tmp_path / "none"))
+
+    def never_downloaded(repo, revision=None, allow_patterns=None):
+        raise OSError(repo)
+
+    monkeypatch.setattr(clients, "snapshot", never_downloaded)
+    with pytest.raises(FileNotFoundError, match="download-translators"):
+        clients.CT2Translator(Endpoints(translator_models="tc-big"))
+    with pytest.raises(ValueError, match="FIHRIS_TRANSLATOR_MODELS"):
+        clients.CT2Translator(Endpoints(translator_models="nllb"))
     with pytest.raises(ValueError, match="ct2 or torch"):
-        open_translator(Endpoints(translator="marian"))
+        clients.open_translator(Endpoints(translator="marian"))
 
 
 def test_pgvector_needs_postgresql_and_a_known_store(tmp_path):
