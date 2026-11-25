@@ -129,19 +129,19 @@ for source in result.sources:
 [`docker/Dockerfile`](https://github.com/oreaba/fihris/blob/main/docker/Dockerfile) builds two images from this repository, for x86-64 or ARM64. Both have Tesseract with Arabic and English, and need no GPU and no torch:
 
 ```
-docker build -f docker/Dockerfile --target online  -t fihris:0.6 .          # fetches the models on first start
-docker build -f docker/Dockerfile --target offline -t fihris:0.6-offline .  # carries the models; never uses the network
+docker build -f docker/Dockerfile --target online  -t fihris .          # fetches the models on first start
+docker build -f docker/Dockerfile --target offline -t fihris:offline .  # carries the models; never uses the network
 ```
 
 - **`online`:** on its first start, the entrypoint runs `fihris download-models` into `/data/hf`. It keeps them there for later starts.
-- **`offline`:** the models are fetched at build time into `/models/hf` (`--build-arg TRANSLATORS=tc-big` for the other set), and the image runs with `HF_HUB_OFFLINE=1`. To carry it to an air-gapped machine, use `docker save fihris:0.6-offline | gzip > fihris-offline.tar.gz`, then `docker load` there.
+- **`offline`:** the models are fetched at build time into `/models/hf` (`--build-arg TRANSLATORS=tc-big` for the other set), and the image runs with `HF_HUB_OFFLINE=1`. To carry it to an air-gapped machine, use `docker save fihris:offline | gzip > fihris-offline.tar.gz`, then `docker load` there.
 
 The image's command is `fihris`. `/data` holds the work folder, `/data/documents` the files to ingest and `/data/fonts` the fonts for Arabic PDFs:
 
 ```
 docker run --rm --network host -v "$PWD/data:/data" -v "$PWD/documents:/data/documents:ro" \
   -v "$PWD/fonts:/data/fonts:ro" -e FIHRIS_DATABASE_URL=postgresql+psycopg://fihris:change-me@127.0.0.1:5432/fihris \
-  fihris:0.6-offline ingest /data/documents --visible-to-all
+  fihris:offline ingest /data/documents --visible-to-all
 ```
 
 `--network host` lets it reach PostgreSQL and the model servers on the host's loopback; otherwise set `FIHRIS_DATABASE_URL`, `FIHRIS_EMBED_URL` and `FIHRIS_RERANK_URL` to addresses it can reach.

@@ -16,11 +16,16 @@ from __future__ import annotations
 import json
 import threading
 import urllib.request
+import warnings
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Protocol
 
 import numpy as np
+
+# The measured translators tokenize without sacremoses: installing it, as this warning suggests,
+# adds Moses punctuation normalisation and changes translations.
+warnings.filterwarnings("ignore", message="Recommended: pip install sacremoses")
 
 from fihris.config import (
     PINNED,

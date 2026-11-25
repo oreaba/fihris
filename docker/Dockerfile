@@ -1,9 +1,9 @@
 # Fihris images, built from this repository. Two targets:
-#   online   fihris:<version>          fetches the models on first start, into /data/hf
-#   offline  fihris:<version>-offline  carries the models and never uses the network
+#   online   fihris          fetches the models on first start, into /data/hf
+#   offline  fihris:offline  carries the models and never uses the network
 #
-#   docker build -f docker/Dockerfile --target online  -t fihris:0.6 .
-#   docker build -f docker/Dockerfile --target offline -t fihris:0.6-offline .
+#   docker build -f docker/Dockerfile --target online  -t fihris .
+#   docker build -f docker/Dockerfile --target offline -t fihris:offline .
 #
 # Both need PostgreSQL with pgvector (FIHRIS_DATABASE_URL) and the embedding and reranker
 # servers (FIHRIS_EMBED_URL, FIHRIS_RERANK_URL). Neither needs a GPU or torch.
