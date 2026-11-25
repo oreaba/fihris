@@ -7,7 +7,8 @@ They are only clients: nothing here starts, stops or reconfigures a server.
   first class probability;
 - translation: opus-mt with beam search over one question at a time, either through CTranslate2
   (``CT2Translator``, the default: ready-made models, no torch, on the CPU) or through
-  transformers and torch (``OpusTranslator``, on the GPU by default).
+  transformers and torch (``OpusTranslator``, on the GPU by default); or a translation model
+  behind ``/v1/chat/completions`` (``ServerTranslator``).
 """
 
 from __future__ import annotations
@@ -21,7 +22,13 @@ from typing import Protocol
 
 import numpy as np
 
-from fihris.config import PINNED, TOKENIZER_PATTERNS, TRANSLATOR_SETS, Endpoints
+from fihris.config import (
+    PINNED,
+    SERVER_TRANSLATION,
+    TOKENIZER_PATTERNS,
+    TRANSLATOR_SETS,
+    Endpoints,
+)
 
 
 class Embedder(Protocol):
@@ -270,13 +277,35 @@ def convert_translators(endpoints: Endpoints, out: Path | None = None,
     return report
 
 
+class ServerTranslator:
+    """A translation model behind an OpenAI-compatible ``/v1/chat/completions``, such as vLLM
+    serving ``tencent/Hy-MT3-1.8B``: one request per question, greedy. The prompt and settings
+    are ``SERVER_TRANSLATION``'s."""
+
+    def __init__(self, endpoints: Endpoints):
+        self.url, self.model = endpoints.translate_url, endpoints.translate_model
+        self.timeout = endpoints.timeout_s
+
+    def translate(self, text: str, source_lang: str) -> str:
+        prompt = SERVER_TRANSLATION["prompt"].format(
+            target=SERVER_TRANSLATION["target"][source_lang], text=text)
+        body = {"model": self.model, "messages": [{"role": "user", "content": prompt}],
+                **SERVER_TRANSLATION["sampling"]}
+        reply = _post(f"{self.url}/v1/chat/completions", body, self.timeout)
+        return reply["choices"][0]["message"]["content"].strip()
+
+
 def open_translator(endpoints: Endpoints) -> Translate:
-    """The translator ``FIHRIS_TRANSLATOR`` names: ``ct2`` (the default) or ``torch``."""
+    """The translator ``FIHRIS_TRANSLATOR`` names: ``ct2`` (the default), ``torch`` or
+    ``server``."""
     if endpoints.translator == "ct2":
         return CT2Translator(endpoints)
     if endpoints.translator == "torch":
         return OpusTranslator(endpoints)
-    raise ValueError(f"FIHRIS_TRANSLATOR must be ct2 or torch, not {endpoints.translator!r}")
+    if endpoints.translator == "server":
+        return ServerTranslator(endpoints)
+    raise ValueError(f"FIHRIS_TRANSLATOR must be ct2, torch or server, not "
+                     f"{endpoints.translator!r}")
 
 
 def health(url: str, timeout: float = 5.0) -> bool:

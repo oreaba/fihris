@@ -311,14 +311,16 @@ def cmd_convert_translators(args) -> int:
 
 
 def _translator(endpoints: Endpoints, name: str):
-    """``torch``, ``converted`` (FIHRIS_TRANSLATOR_DIR, default ``translators``) or the name of a
-    ready-made set."""
+    """``torch``, ``server`` (FIHRIS_TRANSLATE_URL), ``converted`` (FIHRIS_TRANSLATOR_DIR,
+    default ``translators``) or the name of a ready-made set."""
     from dataclasses import replace
 
-    from fihris.clients import CT2Translator, OpusTranslator
+    from fihris.clients import CT2Translator, OpusTranslator, ServerTranslator
 
     if name == "torch":
         return OpusTranslator(endpoints)
+    if name == "server":
+        return ServerTranslator(endpoints)
     if name == "converted":
         folder = endpoints.translator_dir or Path("translators")
         return CT2Translator(replace(endpoints, translator_dir=folder))
@@ -448,7 +450,7 @@ def parser() -> argparse.ArgumentParser:
     s = sub.add_parser("compare-translators", help="two translators on the same questions, and "
                        "the sources retrieval returns with each")
     s.add_argument("questions", type=Path, help="one question per line")
-    names = ["torch", "converted", *sorted(TRANSLATOR_SETS)]
+    names = ["torch", "server", "converted", *sorted(TRANSLATOR_SETS)]
     s.add_argument("--a", choices=names, default="opus-mt", help="default opus-mt")
     s.add_argument("--b", choices=names, default="tc-big", help="default tc-big")
     s.add_argument("--translations-only", action="store_true",

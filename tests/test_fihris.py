@@ -434,8 +434,31 @@ def test_translator_is_ct2_by_default_and_names_what_is_missing(tmp_path, monkey
         clients.CT2Translator(Endpoints(translator_models="tc-big"))
     with pytest.raises(ValueError, match="FIHRIS_TRANSLATOR_MODELS"):
         clients.CT2Translator(Endpoints(translator_models="nllb"))
-    with pytest.raises(ValueError, match="ct2 or torch"):
+    with pytest.raises(ValueError, match="ct2, torch or server"):
         clients.open_translator(Endpoints(translator="marian"))
+
+
+def test_server_translator_sends_the_cards_prompt_greedy(monkeypatch):
+    from fihris import clients
+
+    sent = []
+
+    def post(url, body, timeout):
+        sent.append((url, body))
+        return {"choices": [{"message": {"content": "  كم يوما؟ \n"}}]}
+
+    monkeypatch.setattr(clients, "_post", post)
+    translator = clients.open_translator(Endpoints(translator="server",
+                                                   translate_url="http://t:1"))
+    assert translator.translate("How many days?", "en") == "كم يوما؟"
+    url, body = sent[0]
+    assert url == "http://t:1/v1/chat/completions" and body["model"] == "hy-mt3-1.8b"
+    assert body["temperature"] == 0 and body["max_tokens"] == 256
+    prompt = body["messages"][0]["content"]
+    assert prompt.startswith("Translate the following text into Arabic.")
+    assert prompt.endswith("\n\nHow many days?")
+    translator.translate("كم يوما؟", "ar")
+    assert "into English." in sent[1][1]["messages"][0]["content"]
 
 
 def test_pgvector_needs_postgresql_and_a_known_store(tmp_path):

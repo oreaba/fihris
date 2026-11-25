@@ -48,7 +48,8 @@ These settings are pinned in [`config.py`](https://github.com/oreaba/fihris/blob
 | PostgreSQL with the pgvector extension: documents, pages, chunks, builds, jobs and the vectors | `postgresql+psycopg://fihris@127.0.0.1:5432/fihris` | `FIHRIS_DATABASE_URL` |
 | Vector store: `pgvector`, or `qdrant` (see [Vector store](#vector-store)) | `pgvector` | `FIHRIS_VECTOR_STORE` |
 | Qdrant, only when it is the vector store | `127.0.0.1:6333` (gRPC 6334) | `FIHRIS_QDRANT_HOST`, `FIHRIS_QDRANT_PORT`, `FIHRIS_QDRANT_GRPC_PORT` |
-| Translator: `ct2`, or `torch` (see [Translator](#translator)) | `ct2` | `FIHRIS_TRANSLATOR` |
+| Translator: `ct2`, `server` or `torch` (see [Translator](#translator)) | `ct2` | `FIHRIS_TRANSLATOR` |
+| Translation server, for `server` (OpenAI-compatible `/v1/chat/completions`, and its served model name) | `http://127.0.0.1:8102`, `hy-mt3-1.8b` | `FIHRIS_TRANSLATE_URL`, `FIHRIS_TRANSLATE_MODEL` |
 | Translator models: a ready-made set in the Hugging Face cache (`fihris download-translators`) | `opus-mt` | `FIHRIS_TRANSLATOR_MODELS` |
 | Or your own converted copies (`fihris convert-translators`) | unset | `FIHRIS_TRANSLATOR_DIR` |
 | Translator device | `cpu` for `ct2`, `cuda` for `torch` | `FIHRIS_TRANSLATOR_DEVICE` |
@@ -140,9 +141,10 @@ The models come ready-made from the Hugging Face Hub, pinned to the revisions te
 Other ways to run the translator:
 
 - **Your own conversion:** `fihris convert-translators` converts `Helsinki-NLP/opus-mt-en-ar` and `-ar-en` from the Hugging Face cache into CTranslate2's format in float32. It needs torch once (`fihris[torch]`, or an environment that has it, such as a vLLM container). Set `FIHRIS_TRANSLATOR_DIR` to its output folder to use it.
+- **A translation model on a server:** `FIHRIS_TRANSLATOR=server` sends each question to an OpenAI-compatible `/v1/chat/completions` at `FIHRIS_TRANSLATE_URL` (default `http://127.0.0.1:8102`), as the served model `FIHRIS_TRANSLATE_MODEL` (default `hy-mt3-1.8b`), with Hy-MT3's prompt and greedy decoding. For example, vLLM serving `tencent/Hy-MT3-1.8B` (Apache 2.0) on the GPU, next to the embedding and reranker servers.
 - **torch:** `FIHRIS_TRANSLATOR=torch` with `pip install "fihris[torch]"` runs `Helsinki-NLP/opus-mt-en-ar` and `-ar-en` through transformers, on the GPU by default, as fihris 0.3 and earlier did. On 100 test questions, a float32 CTranslate2 conversion gave the same translation as torch for 93; the other 7 differed by 1 to 6 words.
 
-`fihris compare-translators questions.txt --a opus-mt --b tc-big` runs two translators on the same questions and reports how many translations are identical. For those that differ, it runs retrieval with each and reports whether the sources change. Each side is `torch`, `converted` or a set's name; it needs the whole pipeline unless `--translations-only`.
+`fihris compare-translators questions.txt --a opus-mt --b tc-big` runs two translators on the same questions and reports how many translations are identical. For those that differ, it runs retrieval with each and reports whether the sources change. Each side is `torch`, `server`, `converted` or a set's name; it needs the whole pipeline unless `--translations-only`.
 
 transformers notes on start that PyTorch was not found: fihris only uses its tokenizers.
 

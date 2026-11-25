@@ -35,6 +35,15 @@ TRANSLATOR_SETS = {
 }
 TOKENIZER_PATTERNS = ["*.spm", "vocab.json", "tokenizer_config.json", "special_tokens_map.json"]
 
+# A translation model served behind an OpenAI-compatible chat API (FIHRIS_TRANSLATOR=server):
+# Hy-MT3's own prompt (its model card), greedy, with the card's repetition penalty.
+SERVER_TRANSLATION = {
+    "prompt": ("Translate the following text into {target}. Note that you should only output "
+               "the translated result without any additional explanation:\n\n{text}"),
+    "target": {"en": "Arabic", "ar": "English"},
+    "sampling": {"temperature": 0, "repetition_penalty": 1.05, "max_tokens": 256},
+}
+
 
 @dataclass(frozen=True)
 class Pinned:
@@ -95,6 +104,8 @@ class Endpoints:
     translator_models: str = "opus-mt"
     translator_dir: Path | None = None
     translator_device: str = ""
+    translate_url: str = "http://127.0.0.1:8102"
+    translate_model: str = "hy-mt3-1.8b"
     min_free_gpu_gib: float = 2.0
     timeout_s: float = 120.0
 
@@ -120,5 +131,7 @@ class Endpoints:
             translator_dir=Path(env("FIHRIS_TRANSLATOR_DIR")) if env("FIHRIS_TRANSLATOR_DIR")
             else base.translator_dir,
             translator_device=env("FIHRIS_TRANSLATOR_DEVICE", base.translator_device),
+            translate_url=env("FIHRIS_TRANSLATE_URL", base.translate_url),
+            translate_model=env("FIHRIS_TRANSLATE_MODEL", base.translate_model),
             min_free_gpu_gib=float(env("FIHRIS_MIN_FREE_GPU_GIB", base.min_free_gpu_gib)),
             timeout_s=float(env("FIHRIS_TIMEOUT_S", base.timeout_s)))
