@@ -1,10 +1,14 @@
 """Fihris: retrieval, access filtering, builds, the library, ingestion and the extraction queue.
 Model servers are replaced by deterministic fakes. The engine tests run on SQLite with the NumPy
-store, and again on PostgreSQL with pgvector when ``FIHRIS_TEST_PG_URL`` names a database the
-tests may wipe (its ``fihris`` schema is dropped before each test)."""
+store; again on PostgreSQL with pgvector when ``FIHRIS_TEST_PG_URL`` names a database the tests
+may wipe (its ``fihris`` schema is dropped before each test); and again on SQLite with Qdrant
+when ``FIHRIS_TEST_QDRANT`` names a Qdrant the tests may wipe, as ``host:port:grpc_port`` (every
+``fihris_`` collection is deleted before each test)."""
 
 from __future__ import annotations
 
+import dataclasses
+import datetime as dt
 import hashlib
 import os
 
@@ -24,6 +28,7 @@ from fihris.vectors import (
     MemoryIndex,
     PgVectorIndex,
     Point,
+    QdrantIndex,
     collection_name,
     open_index,
     same_ranking,
@@ -166,12 +171,33 @@ def fresh_postgres():
     return db
 
 
-@pytest.fixture(params=["memory", "pgvector"])
+def fresh_qdrant() -> Endpoints:
+    spec = os.environ.get("FIHRIS_TEST_QDRANT")
+    if not spec:
+        pytest.skip("FIHRIS_TEST_QDRANT is not set")
+    host, port, grpc = spec.split(":")
+    endpoints = Endpoints(vector_store="qdrant", qdrant_host=host, qdrant_port=int(port),
+                          qdrant_grpc_port=int(grpc))
+    index = QdrantIndex(endpoints)
+    for collection in index.client.get_collections().collections:
+        if collection.name.startswith("fihris_"):
+            index.client.delete_collection(collection.name)
+    index.close()
+    return endpoints
+
+
+@pytest.fixture(params=["memory", "pgvector", "qdrant"])
 def engine(request, tmp_path):
+    endpoints = Endpoints(work_dir=tmp_path / "work")
     if request.param == "pgvector":
         db = fresh_postgres()
         create_schema(db)
         index = PgVectorIndex(db)
+    elif request.param == "qdrant":
+        endpoints = dataclasses.replace(fresh_qdrant(), work_dir=tmp_path / "work")
+        db = engine_for(f"sqlite:///{tmp_path / 'f.db'}")
+        create_schema(db)
+        index = QdrantIndex(endpoints)
     else:
         db = engine_for(f"sqlite:///{tmp_path / 'f.db'}")
         create_schema(db)
@@ -190,15 +216,18 @@ def engine(request, tmp_path):
             if session.get(Page, (d, p)) is None:
                 session.add(Page(doc_id=d, page=p, status="ok", text=t.split("\n")[-1], md=""))
         session.commit()
-    eng = Engine(Endpoints(work_dir=tmp_path / "work"), make, index=index,
+    eng = Engine(endpoints, make, index=index,
                  embedder=FakeEmbedder(), scorer=FakeScorer(), translator=FakeTranslator())
-    rows = [{"doc_id": d, "page": p, "chunk": c, "text": t, "headings": []}
-            for d, p, c, t in TEXTS]
-    eng.create_build(rows, FakeEmbedder().embed([r["text"] for r in rows]), None, "test",
+    eng.create_build(ROWS, FakeEmbedder().embed([r["text"] for r in ROWS]), None, "test",
                      activate=True, build_id="build-test")
     yield eng
-    eng.jobs.shutdown(wait=True)
+    eng.close()
+    if request.param == "qdrant":
+        index.close()
     db.dispose()
+
+
+ROWS = [{"doc_id": d, "page": p, "chunk": c, "text": t, "headings": []} for d, p, c, t in TEXTS]
 
 
 def test_text_with_nul_round_trips_and_keeps_fingerprint(tmp_path):
@@ -248,6 +277,350 @@ def test_access_change_reaches_mask_and_store(engine):
     engine.refresh_access("d3")
     result = engine.retrieve("data request approved", Principal.for_groups([], True))
     assert "d3" in {h["doc_id"] for h in result.ranked}
+
+
+def dense_docs(engine, question: str, principal: Principal) -> set[str]:
+    """The documents the store's own dense search returns: the store alone, not the mask."""
+    hits = engine.index.search(FakeEmbedder().embed([question]), principal)[0]
+    return {key[0] for key, _ in hits}
+
+
+def set_document(engine, doc_id: str, **values) -> None:
+    with engine.make_session() as session:
+        doc = session.get(Document, doc_id)
+        for name, value in values.items():
+            setattr(doc, name, value)
+        session.commit()
+
+
+def test_reactivated_build_serves_current_access(engine):
+    """An older build made live again must not return what has been withdrawn since."""
+    engine.create_build(ROWS, FakeEmbedder().embed([r["text"] for r in ROWS]), None, "test",
+                        activate=True, build_id="build-second")
+    set_document(engine, "d3", groups=["board"])        # hr loses d3
+    set_document(engine, "d2", status="superseded")     # d2 leaves search
+    set_document(engine, "d1", removed=True)            # d1 removed
+    engine.refresh_access(["d1", "d2", "d3"])           # reaches only the live build
+    engine.activate("build-test")                       # the build that still says otherwise
+    hr = Principal.for_groups(["hr"], False)
+    for question in ("annual leave approved", "data request approved", "sick leave"):
+        assert dense_docs(engine, question, hr).isdisjoint({"d1", "d2", "d3"})
+        assert {h["doc_id"] for h in engine.retrieve(question, hr).ranked}.isdisjoint(
+            {"d1", "d2", "d3"})
+
+
+def test_activation_applies_grants_made_while_a_build_was_written(engine):
+    """``reindex_corpus`` writes a build, then activates it: access changed in between counts."""
+    engine.create_build(ROWS, FakeEmbedder().embed([r["text"] for r in ROWS]), None, "test",
+                        activate=False, build_id="build-next")
+    set_document(engine, "d4", visible_to_all=True)      # granted to everyone
+    set_document(engine, "d3", status="duplicate")       # withdrawn
+    engine.refresh_access(["d3", "d4"])
+    engine.activate("build-next")
+    everyone = Principal.for_groups([], True)
+    assert "d4" in dense_docs(engine, "annual leave of directors", everyone)
+    assert "d3" not in dense_docs(engine, "data request approved",
+                                  Principal.for_groups(["hr"], False))
+
+
+def test_access_changed_by_another_engine_is_honoured(engine):
+    """A second engine on the same database stands for ``fihris access`` in another process."""
+    other = Engine(engine.endpoints, sessions(engine.make_session.kw["bind"]), index=engine.index,
+                   embedder=FakeEmbedder(), scorer=FakeScorer(), translator=FakeTranslator())
+    other.load()
+    everyone = Principal.for_groups([], True)
+    assert "d1" in {h["doc_id"] for h in engine.retrieve("annual leave", everyone).ranked}
+
+    set_document(other, "d1", visible_to_all=False)    # a removal, made over there
+    other.refresh_access(["d1"])
+    assert "d1" not in {h["doc_id"] for h in engine.retrieve("annual leave", everyone).ranked}
+
+    set_document(other, "d3", visible_to_all=True)     # a grant, made over there
+    other.refresh_access(["d3"])
+    ranked = {h["doc_id"] for h in engine.retrieve("data request approved", everyone).ranked}
+    assert "d3" in ranked
+    other.close()
+
+
+def test_access_stamp_moves_for_any_writer(engine):
+    from sqlalchemy import update
+
+    with engine.make_session() as session:
+        before = Engine.read_stamps(session)
+        session.execute(update(Document).where(Document.doc_id == "d4")
+                        .values(groups=["hr"]))      # raw SQL, no fihris code path
+        session.commit()
+        moved = Engine.read_stamps(session)
+        session.execute(update(Document).where(Document.doc_id == "d4").values(title="Annex"))
+        session.commit()
+        unrelated = Engine.read_stamps(session)
+    assert moved["access"] > before["access"] and unrelated == moved
+    assert moved["live"] == before["live"]
+    assert engine.sync() == "access" and engine.sync() is None
+
+
+def drain(eng: Engine) -> None:
+    """Wait for the engine's queued jobs: its one worker runs them in order."""
+    eng.jobs.submit(lambda: None).result()
+
+
+def other_engine(engine) -> Engine:
+    """A second engine on the same database and store: another process, for the test."""
+    other = Engine(engine.endpoints, sessions(engine.make_session.kw["bind"]), index=engine.index,
+                   embedder=FakeEmbedder(), scorer=FakeScorer(), translator=FakeTranslator())
+    other.load()
+    return other
+
+
+QUESTIONS = ("annual leave approved", "data request approved", "sick leave",
+             "When are expense claims submitted?", "annual leave of directors")
+
+
+def asks_cleanly(engine, principal) -> set[str]:
+    """Every question retrieves without error; the documents they reach."""
+    found = set()
+    for question in QUESTIONS:
+        found |= {h["doc_id"] for h in engine.retrieve(question, principal).ranked}
+    return found
+
+
+def test_live_build_changed_by_another_engine_is_reloaded(engine, tmp_path):
+    """Another process ingests a document, removes one and switches builds: the first engine's
+    next retrieval neither fails nor misses the change, and its access changes reach the build
+    live at that moment."""
+    docx = pytest.importorskip("docx")
+    other = other_engine(engine)
+    everyone = Principal.for_groups([], True)
+
+    d = docx.Document()                                  # 1. an ingest, over there
+    d.add_heading("Expense Claims", level=1)
+    d.add_paragraph("Expense claims are submitted within thirty days with receipts. " * 4)
+    path = tmp_path / "expenses.docx"
+    d.save(path)
+    with other.make_session() as session:
+        doc_id, stored, checksum = other.store_upload(path.read_bytes(), path.name)
+        other.new_document(session, doc_id, stored, checksum, path.name,
+                           {"visible_to_all": True}, None)
+        session.commit()
+    other.submit("ingest", doc_id, None, path=str(stored))
+    drain(other)
+    assert doc_id in asks_cleanly(engine, everyone)
+
+    other.submit("remove", "d1", None)                   # 2. a removal, over there
+    drain(other)
+    assert "d1" not in asks_cleanly(engine, everyone)
+
+    rows = [r for r in ROWS if r["doc_id"] != "d2"]      # 3. another build made live
+    other.create_build(rows, FakeEmbedder().embed([r["text"] for r in rows]), None, "test",
+                       activate=True, build_id="build-elsewhere")
+    asks_cleanly(engine, everyone)
+    assert engine.build.build_id == "build-elsewhere"
+    assert "d2" not in {u.doc_id for u in engine.chunks.units}
+
+    set_document(engine, "d3", visible_to_all=True)     # an access change made here...
+    engine.refresh_access(["d3"])
+    assert "d3" in dense_docs(engine, "data request approved", everyone)   # ...reaches it
+    other.close()
+
+
+def test_build_switch_committed_during_an_access_catch_up_is_loaded(engine, monkeypatch):
+    """Another process changes access, then switches builds while this engine is catching up
+    with the access change. The switch must not be marked as seen without being loaded."""
+    other = other_engine(engine)
+    set_document(other, "d3", visible_to_all=True)        # access moves: the catch-up starts
+    other.refresh_access(["d3"])
+    rows = [r for r in ROWS if r["doc_id"] != "d2"]
+    real, calls = Engine.read_stamps, []
+
+    def read_stamps(session):
+        calls.append(1)
+        if len(calls) == 2:                               # inside the catch-up, under the lock
+            other.create_build(rows, FakeEmbedder().embed([r["text"] for r in rows]), None,
+                               "test", activate=True, build_id="build-mid")
+        return real(session)
+
+    monkeypatch.setattr(engine, "read_stamps", read_stamps)
+    everyone = Principal.for_groups([], True)
+    asks_cleanly(engine, everyone)
+    asks_cleanly(engine, everyone)
+    assert engine.build.build_id == "build-mid"
+    assert "d2" not in {u.doc_id for u in engine.chunks.units}
+    other.close()
+
+
+def test_revocation_committed_during_refresh_access_is_honoured(engine, monkeypatch):
+    """A revocation committed by another process after this engine read the access map, but
+    before it recorded the access stamp, is still applied at the next retrieval."""
+    other = other_engine(engine)
+    real, fired = engine.access_map, []
+
+    def access_map(session):
+        result = real(session)
+        if not fired:                                     # after the read, before recording
+            fired.append(1)
+            set_document(other, "d2", visible_to_all=False)
+            other.refresh_access(["d2"])
+        return result
+
+    monkeypatch.setattr(engine, "access_map", access_map)
+    engine.refresh_access(["d3"])           # nothing pending: its own map read is the first
+    assert fired
+    everyone = Principal.for_groups([], True)
+    assert "d2" not in asks_cleanly(engine, everyone)
+    assert "d1" in asks_cleanly(engine, everyone)
+    other.close()
+
+
+def test_retrievals_racing_after_a_build_change_reload_once(engine, monkeypatch):
+    import threading
+    import time
+
+    other = other_engine(engine)
+    other.create_build(ROWS, FakeEmbedder().embed([r["text"] for r in ROWS]), None, "test",
+                       activate=True, build_id="build-race")
+    real, loads = engine.load, []
+
+    def slow_load():
+        loads.append(1)
+        time.sleep(0.3)                                   # every racer sees the moved stamp
+        real()
+
+    monkeypatch.setattr(engine, "load", slow_load)
+    barrier = threading.Barrier(6)
+    errors = []
+
+    def ask():
+        barrier.wait()
+        try:
+            engine.retrieve("annual leave approved", Principal.for_groups([], True))
+        except Exception as error:  # noqa: BLE001 - collected for the assertion
+            errors.append(error)
+
+    threads = [threading.Thread(target=ask) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors and len(loads) == 1 and engine.build.build_id == "build-race"
+    other.close()
+
+
+def test_revocation_holds_when_the_store_write_fails(engine, monkeypatch):
+    """The database commits a revocation, then the store's access write fails (the store down
+    during the change). Retrieval must still return nothing from that document."""
+    def store_down(collection, access):
+        raise ConnectionError("vector store unreachable")
+
+    monkeypatch.setattr(engine.index, "set_access_many", store_down)
+    set_document(engine, "d1", visible_to_all=False)
+    with pytest.raises(ConnectionError):
+        engine.refresh_access(["d1"])
+    everyone = Principal.for_groups([], True)
+    assert "d1" in dense_docs(engine, "annual leave", everyone)       # the store is stale...
+    for question in QUESTIONS:
+        result = engine.retrieve(question, everyone)                  # ...retrieval is not
+        assert "d1" not in {h["doc_id"] for h in result.ranked}
+        assert "d1" not in {s.doc_id for s in result.sources}
+
+
+def test_a_build_being_written_does_not_reload_the_live_one(engine):
+    """A corpus re-index writes a new build beside the live one; questions keep the loaded
+    build until the switch."""
+    other = other_engine(engine)
+    other.create_build(ROWS, FakeEmbedder().embed([r["text"] for r in ROWS]), None, "test",
+                       activate=False, build_id="build-in-progress")
+    assert engine.sync() is None
+    other.activate("build-in-progress")
+    assert engine.sync() == "build" and engine.build.build_id == "build-in-progress"
+    other.close()
+
+
+def test_refresh_access_writes_to_the_build_live_now(engine):
+    """Even before this engine has noticed a switch made elsewhere."""
+    other = other_engine(engine)
+    other.create_build(ROWS, FakeEmbedder().embed([r["text"] for r in ROWS]), None, "test",
+                       activate=True, build_id="build-switched")
+    set_document(engine, "d4", visible_to_all=True)
+    engine.refresh_access(["d4"])           # no retrieval in between
+    assert "d4" in dense_docs(engine, "annual leave of directors", Principal.for_groups([], True))
+    other.close()
+
+
+def test_recover_interrupted_fails_only_jobs_whose_process_died(engine):
+    from fihris.db import Job
+
+    old, fresh = dt.datetime.now(dt.UTC) - dt.timedelta(minutes=5), dt.datetime.now(dt.UTC)
+    with engine.make_session() as session:
+        session.add_all([
+            Job(job_id="job_dead", type="ingest", doc_id="d3", state="running",
+                heartbeat_at=old, steps=[{"step": "extract", "state": "running"}]),
+            Job(job_id="job_legacy", type="remove", doc_id=None, state="queued",
+                heartbeat_at=None, steps=[{"step": "remove", "state": "queued"}]),
+            Job(job_id="job_alive", type="reindex_corpus", state="running", heartbeat_at=fresh,
+                steps=[]),
+            Job(job_id="job_mine", type="reindex_document", doc_id="d1", state="queued",
+                heartbeat_at=old, steps=[]),
+            Job(job_id="job_done", type="remove", state="succeeded", heartbeat_at=old,
+                steps=[])])
+        session.commit()
+    engine._mine.add("job_mine")             # queued in this engine, beat not yet sent
+    assert sorted(engine.recover_interrupted()) == ["job_dead", "job_legacy"]
+    with engine.make_session() as session:
+        dead = session.get(Job, "job_dead")
+        assert dead.state == "failed" and dead.errors[-1]["code"] == "interrupted"
+        assert dead.steps[0]["state"] == "failed" and dead.finished_at is not None
+        assert session.get(Document, "d3").index_state == "failed"
+        assert "ingestion_failed" in session.get(Document, "d3").flags
+        assert session.get(Job, "job_alive").state == "running"
+        assert session.get(Job, "job_mine").state == "queued"
+        assert session.get(Job, "job_done").state == "succeeded"
+    engine.beat()
+    with engine.make_session() as session:
+        beat = session.get(Job, "job_mine").heartbeat_at
+        assert (beat.replace(tzinfo=dt.UTC) if beat.tzinfo is None else beat) > old
+    assert engine.recover_interrupted() == []
+    engine._mine.discard("job_mine")
+
+
+def test_submitted_jobs_carry_a_heartbeat(engine):
+    from fihris.db import Job
+
+    job_id = engine.submit("remove", "d4", "u1")
+    with engine.make_session() as session:
+        assert session.get(Job, job_id).heartbeat_at is not None
+    engine.jobs.shutdown(wait=True)
+    assert job_id not in engine._mine
+
+
+def test_upgrade_schema_brings_an_older_database_up(tmp_path):
+    """A database made by fihris 0.7 (no heartbeat column, no stamps) gains both, and the
+    upgrade can run again."""
+    from sqlalchemy import inspect
+
+    from fihris.db import Base, upgrade_schema
+
+    url = os.environ.get("FIHRIS_TEST_PG_URL")
+    db = fresh_postgres() if url else engine_for(f"sqlite:///{tmp_path / 'old.db'}")
+    postgres = db.dialect.name == "postgresql"
+    if postgres:
+        with db.begin() as conn:
+            conn.exec_driver_sql("CREATE SCHEMA fihris")
+    Base.metadata.create_all(db)
+    prefix = "fihris." if postgres else ""
+    with db.begin() as conn:
+        conn.exec_driver_sql(f"ALTER TABLE {prefix}jobs DROP COLUMN heartbeat_at")
+        conn.exec_driver_sql(f"DROP TABLE {prefix}stamps")
+    upgrade_schema(db)
+    upgrade_schema(db)
+    columns = {c["name"] for c in inspect(db).get_columns(
+        "jobs", schema="fihris" if postgres else None)}
+    assert "heartbeat_at" in columns
+    make = sessions(db)
+    with make() as session:
+        session.add(Document(doc_id="dx", title="X"))
+        session.commit()
+        assert Engine.read_stamps(session)["access"] >= 1
+    db.dispose()
 
 
 def test_page_view_highlights_in_utf16(engine):

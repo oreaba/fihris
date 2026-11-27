@@ -28,6 +28,10 @@ It stops there: generating the answer from the sources is the caller's job.
 
 Other jobs reuse these steps: `replace` (a new version of a file: all six), `remove`, `reindex_document` and `rechunk_page` (chunk, embed, index) and `reindex_corpus` (chunk, embed and index into a new build, then switch the live alias). `fihris import-pages` (see [Use](#use)) loads page text extracted elsewhere and skips extraction.
 
+**Interrupted jobs:** while an engine is alive it refreshes a heartbeat on every job it has queued or is running, every 10 seconds. After a crash or restart, `Engine.recover_interrupted()` marks jobs still `queued` or `running` as `failed`, with the error code `interrupted`, but only when their heartbeat is more than a minute old. Jobs that `fihris ingest` or `fihris reindex` are running in another live process are left alone. Jobs written by fihris 0.7 or earlier have no heartbeat and count as stale.
+
+**Upgrading a database:** `create_schema` calls `upgrade_schema`, which adds what 0.8 needs to a database made by an earlier version: the jobs' `heartbeat_at` column, and `fihris.stamps` with its triggers. It is idempotent.
+
 ## Retrieval
 
 1. Translate the question into the other language (opus-mt through CTranslate2, on the CPU; see [Translator](#translator)).
@@ -187,6 +191,15 @@ To move a Qdrant build to pgvector without re-embedding, keep Qdrant reachable a
 - `Principal.for_groups(groups, pilot_mode)`: in pilot mode a principal is narrowed to `all` alone.
 - `Principal.unrestricted()` exists for the command line and offline checks; nothing a caller sends can produce it.
 - Superseded, duplicate and removed documents are never returned by search.
+- **After changing documents' groups, visibility or status,** call `Engine.refresh_access(doc_ids)` with one id or a list. It updates the engine's keyword mask and those documents' points in the live build.
+- **Changes made by another process** (`fihris access`, `fihris ingest`, `fihris reindex`, `fihris activate`, another engine, or SQL) are honoured too. Triggers raise two counters in `fihris.stamps`:
+  - `access`, on any change to a document's access
+  - `live`, when chunks are added to or removed from the live build, or a build becomes or stops being live
+
+  Each engine reads both before every retrieval. A moved `access` reloads its mask; a moved `live` reloads the whole build. Writing a new build beside the live one doesn't count, so a corpus re-index in progress costs running engines nothing until it is activated.
+- **Dense hits are checked twice:** by the store's filter, and again against the engine's in-memory access map, the same rule keyword search uses. The store's copy of access can lag the database, or stay stale if its write fails after the database committed, for example with Qdrant down during a change. Neither can return a revoked document.
+- **Access changes go to the build live now:** `refresh_access` writes to whichever build is live in the database at that moment, even if another process switched builds since this engine loaded one.
+- **Activating a build** (`fihris activate`, or the switch at the end of `reindex_corpus`) first writes every document's current groups and searchable flag to that build's points. A build made or last live earlier never serves access that has changed since.
 
 ## Tests
 
@@ -202,6 +215,13 @@ With `FIHRIS_TEST_PG_URL` set to a PostgreSQL database with pgvector that the te
 ```
 docker run -d -p 127.0.0.1:55432:5432 -e POSTGRES_USER=fihris -e POSTGRES_PASSWORD=fihris pgvector/pgvector:pg18
 FIHRIS_TEST_PG_URL=postgresql+psycopg://fihris:fihris@127.0.0.1:55432/fihris pytest
+```
+
+With `FIHRIS_TEST_QDRANT` set to a Qdrant the tests may wipe (they delete every `fihris_` collection), as `host:port:grpc_port`, the engine tests run a third time with Qdrant as the store (needs the `qdrant` extra):
+
+```
+docker run -d -p 127.0.0.1:56333:6333 -p 127.0.0.1:56334:6334 -e QDRANT__TELEMETRY_DISABLED=true qdrant/qdrant:v1.20.2
+FIHRIS_TEST_QDRANT=127.0.0.1:56333:56334 pytest
 ```
 
 ## License

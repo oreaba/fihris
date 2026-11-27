@@ -67,6 +67,7 @@ class ChunkSet:
         self.doc_ids = [u.doc_id for u in self.units]
         self.bm25 = bm25.BM25([bm25.tokenize(u.text) for u in self.units])
         self._masks: dict[frozenset[str] | None, np.ndarray] = {}
+        self._allowed: dict[frozenset[str] | None, frozenset[str]] = {}
 
     @classmethod
     def from_file(cls, path: Path, access: dict[str, Access] | None = None) -> ChunkSet:
@@ -79,15 +80,24 @@ class ChunkSet:
     def set_access(self, access: dict[str, Access]) -> None:
         self.access = access
         self._masks.clear()
+        self._allowed.clear()
+
+    def allowed_docs(self, principal: Principal) -> frozenset[str]:
+        """The documents the principal may retrieve, by the in-memory access map."""
+        key = principal.allowed
+        if key not in self._allowed:
+            docs = {doc for doc, a in self.access.items()
+                    if a.searchable and principal.may_read(a.groups)}
+            if not self.access:
+                docs = set(self.doc_ids) if key is None else set()
+            self._allowed[key] = frozenset(docs)
+        return self._allowed[key]
 
     def mask(self, principal: Principal) -> np.ndarray:
         """Which units the principal may retrieve."""
         key = principal.allowed
         if key not in self._masks:
-            allowed_docs = {doc for doc, a in self.access.items()
-                            if a.searchable and principal.may_read(a.groups)}
-            if not self.access:
-                allowed_docs = set(self.doc_ids) if key is None else set()
+            allowed_docs = self.allowed_docs(principal)
             self._masks[key] = np.fromiter((d in allowed_docs for d in self.doc_ids), dtype=bool,
                                            count=len(self.doc_ids))
         return self._masks[key]

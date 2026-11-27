@@ -140,10 +140,9 @@ def cmd_access(args) -> int:
                 doc.groups = sorted(set(args.groups))
         session.commit()
         ids = [d.doc_id for d in docs]
-    engine.refresh_access()
-    if engine.build is not None:
-        for doc_id in ids:
-            engine.refresh_access(doc_id)
+    # The live build's points here; a backend in another process reloads its mask from the
+    # access stamp on its next retrieval.
+    engine.refresh_access(ids)
     _print({"documents_changed": len(ids)})
     return 0
 

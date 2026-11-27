@@ -35,6 +35,8 @@ dependencies = [
     "sentencepiece>=0.2",
     "huggingface-hub>=0.26",
     "pillow>=10.4",
+    # library.render_page: page images for the viewer (Apache 2.0 or BSD-3; not PyMuPDF).
+    "pypdfium2>=4.30",
 ]
 
 [project.optional-dependencies]

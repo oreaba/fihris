@@ -129,6 +129,19 @@ class QdrantIndex:
                                 points=m.Filter(must=[m.FieldCondition(
                                     key="doc_id", match=m.MatchValue(value=doc_id))]), wait=True)
 
+    def set_access_many(self, collection: str,
+                        access: dict[str, tuple[tuple[str, ...], bool]]) -> None:
+        """Every listed document's groups and searchable flag, in batches of payload updates."""
+        m = self.models
+        items = sorted(access.items())
+        for start in range(0, len(items), BATCH):
+            self.client.batch_update_points(collection, update_operations=[
+                m.SetPayloadOperation(set_payload=m.SetPayload(
+                    payload={"groups": list(groups), "searchable": searchable},
+                    filter=m.Filter(must=[m.FieldCondition(
+                        key="doc_id", match=m.MatchValue(value=doc_id))])))
+                for doc_id, (groups, searchable) in items[start:start + BATCH]], wait=True)
+
     def activate(self, collection: str) -> None:
         """Point the live alias at ``collection``, in one operation."""
         m = self.models
@@ -272,6 +285,18 @@ class PgVectorIndex:
                                    "WHERE doc_id = :d"),
                          {"g": list(groups), "s": searchable, "d": doc_id})
 
+    def set_access_many(self, collection: str,
+                        access: dict[str, tuple[tuple[str, ...], bool]]) -> None:
+        """Every listed document's groups and searchable flag, in one transaction."""
+        rows = [{"g": list(groups), "s": searchable, "d": doc_id}
+                for doc_id, (groups, searchable) in sorted(access.items())]
+        if not rows:
+            return
+        with self.db.begin() as conn:
+            conn.execute(self.text(f"UPDATE {self._table(collection)} SET "
+                                   "groups = CAST(:g AS text[]), searchable = :s "
+                                   "WHERE doc_id = :d"), rows)
+
     def activate(self, collection: str) -> None:
         """Point the live alias at ``collection``, in one statement."""
         self._table(collection)
@@ -373,6 +398,11 @@ class MemoryIndex:
         self.collections[collection] = {
             k: (Point(p.doc_id, p.page, p.chunk, p.vector, p.lang, groups, searchable)
                 if p.doc_id == doc_id else p) for k, p in self.collections[collection].items()}
+
+    def set_access_many(self, collection: str,
+                        access: dict[str, tuple[tuple[str, ...], bool]]) -> None:
+        for doc_id, (groups, searchable) in access.items():
+            self.set_access(collection, doc_id, groups, searchable)
 
     def activate(self, collection: str) -> None:
         self.live = collection

@@ -4,10 +4,23 @@ One ``Engine`` per process. It holds the active build's chunk set (texts, langua
 the access mask) and a client for its vector collection, behind the live alias. Document
 changes run as jobs on one worker thread, so the live build changes one document at a time.
 A corpus re-index builds a new collection and switches the alias only when it is complete.
+
+Other processes may share the database (``fihris access``, ``fihris ingest``, ``fihris
+activate``):
+- **Stamps:** triggers raise ``stamps.access`` whenever a document's access changes, and
+  ``stamps.live`` whenever the live build's chunks change or another build becomes live. Each
+  retrieval reads both: a moved ``live`` reloads the whole build, a moved ``access`` the mask.
+- **Access changes** are written to whichever build is live in the database at that moment, not
+  to the one this engine last loaded.
+- **Activation** re-applies every document's current access to the target build before the
+  alias moves, so a build made or last live earlier never serves stale groups.
+- **Jobs** carry a heartbeat while their engine is alive. ``recover_interrupted`` fails only
+  jobs whose heartbeat has gone stale, never another live process's.
 """
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import hashlib
 import json
@@ -24,7 +37,17 @@ from sqlalchemy.orm import Session, sessionmaker
 from fihris.chunking import doc_title
 from fihris.chunks import Access, ChunkSet, chunk_document, unit_language
 from fihris.config import PINNED, Endpoints
-from fihris.db import Build, Chunk, Document, ExtractionItem, Job, Page, new_id, now
+from fihris.db import (
+    Build,
+    Chunk,
+    Document,
+    ExtractionItem,
+    Job,
+    Page,
+    Stamp,
+    new_id,
+    now,
+)
 from fihris.ids import make_doc_id
 from fihris.ingest.extract import ExtractionError, PageRow, extract_file
 from fihris.library import NotFound, document_groups
@@ -34,6 +57,9 @@ from fihris.units import Unit, fingerprint
 from fihris.vectors import Point, collection_name, open_index
 
 EMBED_BATCH = 64
+HEARTBEAT_SECONDS = 10.0
+STALE_AFTER = dt.timedelta(seconds=60)
+LIVE_JOB_STATES = ("queued", "running")
 STEPS = {"ingest": ["extract", "quality_gate", "ocr", "chunk", "embed", "index"],
          "replace": ["extract", "quality_gate", "ocr", "chunk", "embed", "index"],
          "remove": ["remove"],
@@ -68,6 +94,11 @@ class Engine:
         self.build: Build | None = None
         self.lock = threading.RLock()
         self.jobs = ThreadPoolExecutor(1, thread_name_prefix="fihris-job")
+        self.stamps: dict[str, int] = {}
+        self._mine: set[str] = set()
+        self._mine_lock = threading.Lock()
+        self._stop = threading.Event()
+        self._heartbeat: threading.Thread | None = None
 
     # --- clients, created on first use ---------------------------------------------------
     @property
@@ -108,9 +139,14 @@ class Engine:
         return {d.doc_id: Access(tuple(document_groups(d)), d.searchable)
                 for d in session.scalars(select(Document)).all()}
 
+    @staticmethod
+    def read_stamps(session: Session) -> dict[str, int]:
+        return {s.name: s.value for s in session.scalars(select(Stamp)).all()}
+
     def load(self) -> None:
         """Read the active build's chunks into memory. No active build leaves search empty."""
         with self.lock, self.make_session() as session:
+            self.stamps = self.read_stamps(session)
             build = self.active_build(session)
             if build is None:
                 self.build, self.chunks = None, None
@@ -121,15 +157,52 @@ class Engine:
             self.chunks = ChunkSet(units, self.access_map(session))
             self.build = build
 
-    def refresh_access(self, doc_id: str | None = None) -> None:
-        """After a document's groups, visibility or status change: the mask and the store."""
-        with self.lock, self.make_session() as session:
+    def refresh_access(self, doc_ids: str | Iterable[str] | None = None) -> None:
+        """After documents' groups, visibility or status change: the in-memory mask, and, for
+        the documents named, their points in the live build. One id or a list of them."""
+        if isinstance(doc_ids, str):
+            doc_ids = [doc_ids]
+        with self.lock:
+            self._catch_up(force_access=True)
+            with self.make_session() as session:
+                # The build live now, in the database: another process may have switched
+                # builds since this engine loaded one.
+                live = self.active_build(session)
+                access = self.chunks.access if self.chunks is not None else (
+                    self.access_map(session))
+            named = {d: (access[d].groups, access[d].searchable)
+                     for d in (doc_ids or []) if d in access}
+            if live is not None and named:
+                self.index.set_access_many(live.collection, named)
+
+    def sync(self) -> str | None:
+        """Catch up with what other processes changed: the whole build when the live build
+        changed (``"build"``), the access mask when only access changed (``"access"``), or
+        nothing (``None``). One small read when nothing changed; the decision is re-made under
+        the lock, so retrievals that all see one change reload once between them."""
+        with self.make_session() as session:
+            seen = self.read_stamps(session)
+        if seen == self.stamps:
+            return None
+        with self.lock:
+            return self._catch_up()
+
+    def _catch_up(self, force_access: bool = False) -> str | None:
+        """Under ``self.lock``. Each counter is recorded from a read made before the data it
+        stands for, so a change committed in between is never marked as seen."""
+        with self.make_session() as session:
+            stamps = self.read_stamps(session)
+            if stamps.get("live") != self.stamps.get("live"):
+                session.close()
+                self.load()                  # reads the stamps first, then the build
+                return "build"
+            if not force_access and stamps.get("access") == self.stamps.get("access"):
+                return None
             access = self.access_map(session)
-            if self.chunks is not None:
-                self.chunks.set_access(access)
-            if self.build is not None and doc_id and doc_id in access:
-                a = access[doc_id]
-                self.index.set_access(self.build.collection, doc_id, a.groups, a.searchable)
+        if self.chunks is not None:
+            self.chunks.set_access(access)
+        self.stamps["access"] = stamps.get("access", 0)
+        return "access"
 
     def retriever(self) -> Retriever:
         if self.chunks is None:
@@ -138,6 +211,7 @@ class Engine:
 
     def retrieve(self, question: str, principal: Principal,
                  language: str | None = None) -> Retrieval:
+        self.sync()
         with self.lock:
             retriever = self.retriever()
         return retriever.retrieve(question, principal, language)
@@ -195,10 +269,16 @@ class Engine:
         return build_id
 
     def activate(self, build_id: str) -> None:
+        """Make a complete or retired build live. Every document's current groups and
+        searchable flag are written to its points first, so nothing removed, superseded or
+        restricted since the build was written or last live can be returned."""
         with self.lock, self.make_session() as session:
             build = session.get(Build, build_id)
             if build is None or build.state not in ("complete", "retired"):
                 raise ValueError(f"build {build_id} is not complete")
+            access = self.access_map(session)
+            self.index.set_access_many(build.collection, {
+                d: (a.groups, a.searchable) for d, a in access.items()})
             self.index.activate(build.collection)
             for old in session.scalars(select(Build).where(Build.state == "active")).all():
                 old.state = "retired"
@@ -260,6 +340,7 @@ class Engine:
             raise ValueError(f"unknown job type {job_type}")
         with self.make_session() as session:
             job = Job(job_id=new_id("job"), type=job_type, doc_id=doc_id, created_by=created_by,
+                      heartbeat_at=now(),
                       steps=[{"step": s, "state": "queued", "done": 0, "total": 0,
                               "started_at": None, "finished_at": None} for s in STEPS[job_type]])
             session.add(job)
@@ -267,8 +348,64 @@ class Engine:
                 doc.last_job_id = job.job_id
             session.commit()
             job_id = job.job_id
+        with self._mine_lock:
+            self._mine.add(job_id)
+        self._start_heartbeat()
         self.jobs.submit(self._run_job, job_id, kwargs)
         return job_id
+
+    # --- heartbeats and recovery ------------------------------------------------------------
+    def _start_heartbeat(self) -> None:
+        if self._heartbeat is None or not self._heartbeat.is_alive():
+            self._heartbeat = threading.Thread(target=self._beat_loop, daemon=True,
+                                               name="fihris-heartbeat")
+            self._heartbeat.start()
+
+    def _beat_loop(self) -> None:
+        while not self._stop.wait(HEARTBEAT_SECONDS):
+            # A missed beat only ages the heartbeat; the next one catches up.
+            with contextlib.suppress(Exception):
+                self.beat()
+
+    def beat(self) -> None:
+        """Refresh the heartbeat of every job this engine still owns."""
+        with self._mine_lock:
+            mine = list(self._mine)
+        if not mine:
+            return
+        with self.make_session() as session:
+            for job in session.scalars(select(Job).where(Job.job_id.in_(mine),
+                                                         Job.state.in_(LIVE_JOB_STATES))):
+                job.heartbeat_at = now()
+            session.commit()
+
+    def recover_interrupted(self, stale_after: dt.timedelta = STALE_AFTER) -> list[str]:
+        """Jobs left queued or running by a process that died become failed, with the code
+        ``interrupted``. A job is left alone while its heartbeat is fresher than
+        ``stale_after``, so jobs that ``fihris ingest`` or ``fihris reindex`` are running in
+        another live process are never touched. Returns the ids it failed."""
+        cutoff = now() - stale_after
+        with self._mine_lock:
+            mine = set(self._mine)
+        failed = []
+        with self.make_session() as session:
+            for job in session.scalars(select(Job).where(Job.state.in_(LIVE_JOB_STATES))).all():
+                beat = job.heartbeat_at
+                if beat is not None and beat.tzinfo is None:
+                    beat = beat.replace(tzinfo=dt.UTC)
+                if job.job_id in mine or (beat is not None and beat >= cutoff):
+                    continue
+                self._finish(session, job, "failed", [{
+                    "code": "interrupted",
+                    "detail": "the process running this job stopped before it finished"}])
+                failed.append(job.job_id)
+            session.commit()
+        return failed
+
+    def close(self) -> None:
+        """Stop the heartbeat and wait for queued jobs."""
+        self._stop.set()
+        self.jobs.shutdown(wait=True)
 
     def cancel(self, job_id: str) -> bool:
         with self.make_session() as session:
@@ -326,18 +463,25 @@ class Engine:
                 "job_failed")
             state, errors = "failed", [{"code": code, "detail": f"{type(error).__name__}: "
                                                                 f"{error}"[:500]}]
-        with self.make_session() as session:
-            job = session.get(Job, job_id)
-            job.state, job.finished_at = state, now()
-            job.errors = list(job.errors or []) + errors
-            job.steps = [dict(s, state=(state if s["state"] in ("queued", "running") else
-                                        s["state"])) for s in job.steps]
-            if state == "succeeded":
-                job.progress = 1.0
-            if doc_id and (doc := session.get(Document, doc_id)) and state == "failed":
-                doc.index_state = "failed"
-                doc.flags = sorted(set(doc.flags or []) | {"ingestion_failed"})
-            session.commit()
+        try:
+            with self.make_session() as session:
+                self._finish(session, session.get(Job, job_id), state, errors)
+                session.commit()
+        finally:
+            with self._mine_lock:
+                self._mine.discard(job_id)
+
+    @staticmethod
+    def _finish(session: Session, job: Job, state: str, errors: list[dict]) -> None:
+        job.state, job.finished_at = state, now()
+        job.errors = list(job.errors or []) + errors
+        job.steps = [dict(s, state=(state if s["state"] in LIVE_JOB_STATES else s["state"]))
+                     for s in job.steps]
+        if state == "succeeded":
+            job.progress = 1.0
+        if job.doc_id and (doc := session.get(Document, job.doc_id)) and state == "failed":
+            doc.index_state = "failed"
+            doc.flags = sorted(set(doc.flags or []) | {"ingestion_failed"})
 
     # --- one document -------------------------------------------------------------------------
     def store_pages(self, session: Session, doc: Document, rows: list[PageRow]) -> int:

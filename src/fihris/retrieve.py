@@ -77,7 +77,15 @@ class Retriever:
         mask = self.chunks.mask(principal)
         keyword = [self.chunks.keyword(x, mask) for x in texts]
         queries = self.embedder.embed([PINNED.query_instruction + x for x in texts])
-        semantic = [[self.chunks.by_key[key].hit(score) for key, score in hits]
+        # The store filters by access too, but its copy can lag the database, or stay stale when
+        # its write failed after the database committed (the store down during a change). So a
+        # dense hit also needs the in-memory mask's leave, the same rule keyword search uses. A
+        # hit for a chunk this engine does not hold yet (another process is writing the live
+        # build; the engine reloads at its next retrieval) is skipped rather than fail the
+        # question. In steady state neither drops anything.
+        allowed = self.chunks.allowed_docs(principal)
+        semantic = [[self.chunks.by_key[key].hit(score) for key, score in hits
+                     if key in self.chunks.by_key and key[0] in allowed]
                     for hits in self.index.search(queries, principal, PINNED.dense_depth)]
         fused = ranking.rrf([keyword[0], keyword[1], semantic[0], semantic[1]], k=PINNED.rrf_k,
                            depth=PINNED.fusion_depth)
